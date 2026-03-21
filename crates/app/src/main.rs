@@ -450,6 +450,45 @@ fn list_available_scripts() -> Vec<RecentScript> {
     results
 }
 
+/// Generate coaching insights from a compliance report.
+#[tauri::command]
+fn get_coaching(report: SessionReport) -> Vec<CoachingInsight> {
+    let compliance = prompter_core::ComplianceReport {
+        script_title: report.script_title,
+        script_version: report.script_version,
+        sections_covered: report.sections_covered,
+        sections_skipped: report.sections_skipped,
+        duration_secs: report.duration_secs,
+        section_times: report.section_times,
+        pause_points_reached: report.pause_points_reached,
+        pause_points_total: report.pause_points_total,
+        branches_taken: report.branches_taken,
+        total_words: report.total_words,
+        words_delivered: report.words_delivered,
+    };
+
+    prompter_core::coaching::analyze(&compliance)
+        .into_iter()
+        .map(|i| CoachingInsight {
+            severity: match i.severity {
+                prompter_core::coaching::Severity::Praise => "praise".into(),
+                prompter_core::coaching::Severity::Info => "info".into(),
+                prompter_core::coaching::Severity::Warning => "warning".into(),
+                prompter_core::coaching::Severity::Critical => "critical".into(),
+            },
+            message: i.message,
+            advice: i.advice,
+        })
+        .collect()
+}
+
+#[derive(Debug, Serialize)]
+struct CoachingInsight {
+    severity: String,
+    message: String,
+    advice: String,
+}
+
 /// Find a script file by consultation_id in the watched folder.
 fn find_script_by_consultation_id(consultation_id: &str) -> Option<String> {
     let home = dirs_next::home_dir()?;
@@ -556,6 +595,7 @@ fn main() {
             start_audio,
             stop_audio,
             save_compliance,
+            get_coaching,
             load_settings,
             save_settings,
             add_recent_script,

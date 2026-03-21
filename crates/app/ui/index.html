@@ -515,11 +515,20 @@ function setupAlignListener(){
 
   listen('align', (event)=>{
     const {position, confidence, ad_libbing} = event.payload;
+
+    // Update confidence indicator in mic level bar
+    const fill = els.micFill;
+    if(fill){
+      if(ad_libbing) fill.style.background='var(--amber)';
+      else if(confidence > 0.5) fill.style.background='var(--green)';
+      else if(confidence > 0.3) fill.style.background='var(--amber)';
+      else fill.style.background='var(--red)';
+    }
+
     if(state!=='run' && state!=='wait') return;
     if(!tier2Active) return;
 
     // Only correct if confident and position is ahead of current
-    // (prevent jumping backward from noisy recognition)
     if(confidence > 0.4 && position > idx){
       // Map alignment position (sentence-only index) back to items index
       let sentenceCount = 0;
@@ -638,6 +647,52 @@ function endSession(){
     saved.style.cssText = 'font-size:12px;color:var(--text-muted);margin-top:12px';
     saved.textContent = 'Report saved to '+path;
     card.appendChild(saved);
+  }).catch(()=>{});
+
+  // Fetch coaching insights
+  invoke('get_coaching', { report: {
+    script_title: script.title,
+    script_version: script.version || null,
+    sections_covered: covered,
+    sections_skipped: skipped,
+    duration_secs: elapsed,
+    section_times: sectionTimesMap,
+    pause_points_reached: pauseReached,
+    pause_points_total: pauseTotal,
+    branches_taken: branchDecisions,
+    total_words: script.word_count,
+    words_delivered: wordsDelivered
+  }}).then(insights => {
+    if(!insights || !insights.length) return;
+    const coachDiv = document.createElement('div');
+    coachDiv.style.cssText = 'text-align:left;margin-bottom:20px;padding:12px;background:var(--bg);border-radius:var(--radius-sm);border:1px solid var(--border-subtle)';
+
+    const coachTitle = document.createElement('div');
+    coachTitle.style.cssText = 'font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);margin-bottom:8px';
+    coachTitle.textContent = 'Coaching';
+    coachDiv.appendChild(coachTitle);
+
+    const colors = {praise:'var(--green)',warning:'var(--amber)',critical:'var(--red)',info:'var(--text-muted)'};
+    const icons = {praise:'\u2713',warning:'\u26A0',critical:'\u2718',info:'\u2139'};
+
+    insights.slice(0,5).forEach(i => {
+      const row = document.createElement('div');
+      row.style.cssText = 'font-size:13px;padding:4px 0;display:flex;gap:8px;align-items:start';
+      const icon = document.createElement('span');
+      icon.style.cssText = 'color:'+colors[i.severity]+';flex-shrink:0;width:16px;text-align:center';
+      icon.textContent = icons[i.severity]||'';
+      const text = document.createElement('span');
+      text.style.color = 'var(--text-secondary)';
+      text.textContent = i.message;
+      row.appendChild(icon);
+      row.appendChild(text);
+      coachDiv.appendChild(row);
+    });
+
+    // Insert before the Done button
+    const doneBtn = card.querySelector('.btn-primary');
+    if(doneBtn) card.insertBefore(coachDiv, doneBtn);
+    else card.appendChild(coachDiv);
   }).catch(()=>{});
 
   const btn=document.createElement('button');

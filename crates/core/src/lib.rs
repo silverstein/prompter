@@ -1,4 +1,5 @@
 pub mod align;
+pub mod coaching;
 pub mod compliance;
 pub mod error;
 pub mod script;
