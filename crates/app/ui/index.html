@@ -299,6 +299,7 @@ let timer = null;
 let clockId = null;
 let t0 = null;
 let secTimes = {};
+let branchDecisions = {};  // "question text" -> "selected label"
 
 // ── DOM refs ──
 const $=id=>document.getElementById(id);
@@ -390,7 +391,7 @@ function loadScript(data){
       else if(el.type==='pause') items.push({text:el.prompt,words:0,section:si,kind:'p'});
     });
   });
-  idx=0; secTimes={};
+  idx=0; secTimes={}; branchDecisions={};
   buildNav(); buildTP();
   highlight();
   show('nav'); show('startBar'); show('tp');
@@ -619,7 +620,7 @@ function endSession(){
     section_times: sectionTimesMap,
     pause_points_reached: pauseReached,
     pause_points_total: pauseTotal,
-    branches_taken: {},
+    branches_taken: branchDecisions,
     total_words: script.word_count,
     words_delivered: wordsDelivered
   }}).then(path => {
@@ -708,6 +709,8 @@ function buildTP(){
             c.querySelectorAll('.branch-body').forEach(b=>b.classList.remove('show'));
             const target=c.querySelector('[data-bo="'+si+'-'+oi+'"]');
             if(target) target.classList.add('show');
+            // Track branch decision for compliance
+            branchDecisions[el.question] = opt.label;
           });
           opts.appendChild(btn);
         });
