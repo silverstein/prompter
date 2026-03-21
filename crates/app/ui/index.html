@@ -181,6 +181,22 @@
   .help-card table{width:100%;font-size:13px;border-spacing:0}
   .help-card td{padding:5px 0;color:var(--text-secondary)}
   .help-card td:first-child{color:var(--text);font-family:ui-monospace,monospace;width:72px;font-size:12px}
+
+  /* ── Recent scripts ── */
+  .recents{width:100%;max-width:380px;margin-top:8px}
+  .recents-title{font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;padding-left:2px}
+  .recent-item{
+    display:flex;align-items:center;gap:10px;padding:8px 12px;
+    border-radius:var(--radius-sm);cursor:pointer;transition:background .12s;
+    border:1px solid transparent
+  }
+  .recent-item:hover{background:var(--surface);border-color:var(--border)}
+  .recent-item .r-icon{font-size:14px;opacity:.4}
+  .recent-item .r-title{flex:1;font-size:13px;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .recent-item .r-time{font-size:11px;color:var(--text-muted);font-variant-numeric:tabular-nums}
+  .pin{font-size:14px;cursor:pointer;opacity:.4;transition:opacity .15s}
+  .pin:hover{opacity:.7}
+  .pin.on{opacity:1;color:var(--green)}
 </style>
 </head>
 <body>
@@ -197,6 +213,7 @@
     <button class="btn-ghost" id="btnPaste">Paste Script</button>
   </div>
   <span class="hint"><kbd>&#8984;O</kbd> open &middot; <kbd>&#8984;V</kbd> paste &middot; drag &amp; drop</span>
+  <div class="recents" id="recentsContainer"></div>
 </div>
 
 <div class="tp" id="tp"></div>
@@ -230,6 +247,8 @@
     <button id="btnFontUp">A+</button>
     <div class="sep"></div>
     <button id="btnHelp">?</button>
+    <div class="sep"></div>
+    <span class="pin" id="pinBtn" title="Always on top">&#x1F4CC;</span>
   </div>
 </div>
 
@@ -287,7 +306,7 @@ const els = {};
 function initRefs(){
   ['err','nav','empty','tp','startBar','status','dot','micFill','stLabel',
    'progFill','stWords','stTime','speedVal','speedSlider','fontVal',
-   'doneOverlay','doneCard','helpOverlay','helpCard',
+   'doneOverlay','doneCard','helpOverlay','helpCard','recentsContainer','pinBtn',
    'btnOpen','btnPaste','btnStart','btnClose','btnFontDown','btnFontUp','btnHelp'
   ].forEach(id=>{els[id]=$(id)});
 }
@@ -308,17 +327,26 @@ document.addEventListener('DOMContentLoaded', ()=>{
     speed = +e.target.value;
     els.speedVal.textContent = speed+' wpm';
     if(state==='run'){stopScroll();startScroll()}
+    persistSettings();
   });
+  els.pinBtn.addEventListener('click', togglePin);
   // Drag-and-drop on the whole window
   document.addEventListener('dragover', e=>{e.preventDefault();e.stopPropagation()});
   document.addEventListener('drop', handleDrop);
+  // Restore settings + load recents
+  restoreSettings();
+  loadRecents();
 });
 
 // ── File open ──
 async function openFile(){
   try{
     const p = await open({filters:[{name:'Script',extensions:['md','txt','script.md']}],multiple:false});
-    if(p){const d=await invoke('load_script',{path:p});loadScript(d)}
+    if(p){
+      const d=await invoke('load_script',{path:p});
+      loadScript(d);
+      invoke('add_recent_script',{path:p,title:d.title}).catch(()=>{});
+    }
   }catch(e){showErr(String(e))}
 }
 
@@ -730,6 +758,7 @@ function setFont(d){
   fontSize=Math.max(16,Math.min(44,fontSize+d));
   document.documentElement.style.setProperty('--font-size',fontSize+'px');
   els.fontVal.textContent=fontSize;
+  persistSettings();
 }
 
 // ── Help ──
@@ -751,6 +780,85 @@ function hideErr(){els.err.classList.remove('show')}
 function show(id){const e=els[id];e.classList.add('show');e.classList.remove('hide')}
 function hide(id){const e=els[id];e.classList.remove('show');e.classList.add('hide')}
 function fmt(sec){const m=Math.floor(sec/60),s=sec%60;return m+':'+String(s).padStart(2,'0')}
+
+// ── Settings persistence ──
+let pinned = false;
+
+async function restoreSettings(){
+  try{
+    const s = await invoke('load_settings');
+    if(s.font_size && s.font_size !== fontSize){ fontSize=s.font_size; setFont(0); }
+    if(s.speed && s.speed !== speed){
+      speed=s.speed; els.speedSlider.value=speed; els.speedVal.textContent=speed+' wpm';
+    }
+    if(s.always_on_top){ pinned=true; els.pinBtn.classList.add('on'); }
+  }catch(e){}
+}
+
+function persistSettings(){
+  invoke('save_settings', { settings: {
+    font_size: fontSize, speed, always_on_top: pinned, recent_scripts: []
+  }}).catch(()=>{});
+}
+
+async function togglePin(){
+  pinned = !pinned;
+  els.pinBtn.classList.toggle('on', pinned);
+  try{ await invoke('set_always_on_top', {onTop: pinned}); }catch(e){}
+}
+
+// ── Recent scripts + watched folder ──
+async function loadRecents(){
+  const container = els.recentsContainer;
+  while(container.firstChild) container.removeChild(container.firstChild);
+
+  let scripts = [];
+  try{
+    // Recent from settings
+    const settings = await invoke('load_settings');
+    scripts = settings.recent_scripts || [];
+  }catch(e){}
+
+  // Also add watched folder scripts
+  try{
+    const watched = await invoke('list_available_scripts');
+    watched.forEach(w=>{
+      if(!scripts.find(s=>s.path===w.path)) scripts.push(w);
+    });
+  }catch(e){}
+
+  if(!scripts.length) return;
+
+  const title = document.createElement('div');
+  title.className='recents-title';
+  title.textContent='Recent & Available Scripts';
+  container.appendChild(title);
+
+  scripts.slice(0,6).forEach(s=>{
+    const item=document.createElement('div');
+    item.className='recent-item';
+    item.addEventListener('click', async ()=>{
+      try{
+        const d = await invoke('load_script',{path:s.path});
+        loadScript(d);
+      }catch(e){ showErr('Could not load: '+e) }
+    });
+
+    const icon=document.createElement('span');
+    icon.className='r-icon'; icon.textContent='\u{1F4C4}';
+    const titleEl=document.createElement('span');
+    titleEl.className='r-title'; titleEl.textContent=s.title;
+    const time=document.createElement('span');
+    time.className='r-time';
+    if(s.timestamp){
+      const d=new Date(s.timestamp*1000);
+      time.textContent=d.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+    }
+
+    item.appendChild(icon); item.appendChild(titleEl); item.appendChild(time);
+    container.appendChild(item);
+  });
+}
 
 // ── Keyboard ──
 document.addEventListener('keydown', e=>{

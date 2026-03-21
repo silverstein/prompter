@@ -247,6 +247,138 @@ fn save_compliance(report: SessionReport) -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+// ── Settings persistence (~/.prompter/settings.json) ──
+
+fn settings_path() -> std::path::PathBuf {
+    let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".prompter").join("settings.json")
+}
+
+#[derive(Debug, Serialize, serde::Deserialize, Default)]
+struct Settings {
+    #[serde(default = "default_font_size")]
+    font_size: u32,
+    #[serde(default = "default_speed")]
+    speed: u32,
+    #[serde(default)]
+    always_on_top: bool,
+    #[serde(default)]
+    recent_scripts: Vec<RecentScript>,
+}
+
+fn default_font_size() -> u32 { 26 }
+fn default_speed() -> u32 { 150 }
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct RecentScript {
+    path: String,
+    title: String,
+    timestamp: u64,
+}
+
+#[tauri::command]
+fn load_settings() -> Settings {
+    let path = settings_path();
+    if let Ok(data) = fs::read_to_string(&path) {
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        Settings::default()
+    }
+}
+
+#[tauri::command]
+fn save_settings(settings: Settings) -> Result<(), String> {
+    let path = settings_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn add_recent_script(path: String, title: String) -> Result<(), String> {
+    let mut settings = load_settings();
+
+    // Remove duplicate if exists
+    settings.recent_scripts.retain(|r| r.path != path);
+
+    // Add to front
+    settings.recent_scripts.insert(0, RecentScript {
+        path,
+        title,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    });
+
+    // Keep max 10
+    settings.recent_scripts.truncate(10);
+
+    save_settings(settings)
+}
+
+// ── Always-on-top ──
+
+#[tauri::command]
+fn set_always_on_top(app: tauri::AppHandle, on_top: bool) -> Result<(), String> {
+    use tauri::Manager;
+    if let Some(win) = app.get_webview_window("main") {
+        win.set_always_on_top(on_top).map_err(|e| e.to_string())?;
+    }
+    // Persist
+    let mut settings = load_settings();
+    settings.always_on_top = on_top;
+    save_settings(settings)?;
+    Ok(())
+}
+
+// ── List scripts in watched folder ──
+
+#[tauri::command]
+fn list_available_scripts() -> Vec<RecentScript> {
+    let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let scripts_dir = home.join("meetings").join("scripts");
+    let mut results = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(&scripts_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    let title = if let Ok(parsed) = script::parse(&content) {
+                        parsed.frontmatter.title
+                    } else {
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Untitled")
+                            .to_string()
+                    };
+
+                    let modified = entry.metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+
+                    results.push(RecentScript {
+                        path: path.to_string_lossy().to_string(),
+                        title,
+                        timestamp: modified,
+                    });
+                }
+            }
+        }
+    }
+
+    // Sort newest first
+    results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    results
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -255,7 +387,12 @@ fn main() {
             parse_script_text,
             start_audio,
             stop_audio,
-            save_compliance
+            save_compliance,
+            load_settings,
+            save_settings,
+            add_recent_script,
+            set_always_on_top,
+            list_available_scripts
         ])
         .run(tauri::generate_context!())
         .expect("error while running Prompter");
