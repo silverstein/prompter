@@ -1,0 +1,17 @@
+[package]
+name = "prompter-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Prompter — live script guidance for high-stakes conversations"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+prompter-core = { path = "../core" }
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"

@@ -1,0 +1,23 @@
+[package]
+name = "prompter-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Script parser, alignment engine, and compliance tracker for Prompter"
+
+[features]
+default = ["audio"]
+audio = ["dep:cpal", "dep:hound", "dep:crossbeam-channel"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+
+# Audio (optional — only needed for live teleprompter, not script parsing)
+cpal = { version = "0.15", optional = true }
+hound = { version = "3.5", optional = true }
+crossbeam-channel = { version = "0.5", optional = true }
+
+[dev-dependencies]
+pretty_assertions = "1"

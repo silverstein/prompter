@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Prompter</title>
+<style>
+  :root {
+    --bg: #09090b;
+    --surface: #18181b;
+    --surface-hover: #27272a;
+    --border: #27272a;
+    --border-subtle: #1e1e21;
+    --text: #fafafa;
+    --text-secondary: #a1a1aa;
+    --text-muted: #71717a;
+    --text-dimmed: rgba(250,250,250,0.18);
+    --text-upcoming: rgba(250,250,250,0.55);
+    --green: #22c55e;
+    --green-dim: rgba(34,197,94,0.12);
+    --amber: #f59e0b;
+    --amber-dim: rgba(245,158,11,0.10);
+    --blue: #3b82f6;
+    --blue-dim: rgba(59,130,246,0.10);
+    --red: #ef4444;
+    --red-dim: rgba(239,68,68,0.10);
+    --font-size: 26px;
+    --line-height: 1.65;
+    --title-bar-h: 28px;
+    --radius: 10px;
+    --radius-sm: 6px;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif;
+    background:var(--bg); color:var(--text); height:100vh;
+    display:flex; flex-direction:column; overflow:hidden;
+    -webkit-user-select:none; user-select:none;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  /* ── Titlebar drag ── */
+  .titlebar{height:var(--title-bar-h);-webkit-app-region:drag;flex-shrink:0}
+
+  /* ── Error ── */
+  .error-bar{padding:10px 20px;background:var(--red-dim);border-bottom:1px solid var(--red);color:var(--red);font-size:13px;display:none}
+  .error-bar.show{display:flex;align-items:center;gap:8px}
+  .error-bar .dismiss{background:none;border:none;color:var(--red);cursor:pointer;font-size:16px;padding:0 4px}
+
+  /* ── Section nav ── */
+  .nav{display:none;gap:6px;padding:6px 24px;border-bottom:1px solid var(--border-subtle);flex-shrink:0;overflow-x:auto}
+  .nav.show{display:flex}
+  .nav button{
+    background:none;border:1px solid transparent;color:var(--text-muted);
+    padding:3px 12px;border-radius:16px;font-size:12px;font-weight:500;
+    cursor:pointer;white-space:nowrap;transition:all .2s;letter-spacing:.01em
+  }
+  .nav button:hover{color:var(--text-secondary);border-color:var(--border)}
+  .nav button.active{background:var(--green-dim);border-color:rgba(34,197,94,.3);color:var(--green)}
+  .nav button.done{color:var(--green);opacity:.45}
+
+  /* ── Teleprompter ── */
+  .tp{flex:1;overflow-y:auto;padding:48px 48px 240px;scroll-behavior:smooth;scrollbar-width:none;display:none}
+  .tp.show{display:block}
+  .tp::-webkit-scrollbar{display:none}
+
+  .sec-head{
+    font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.12em;
+    color:var(--green);margin:2.5em 0 1.2em;padding-bottom:6px;border-bottom:1px solid var(--border-subtle);
+    display:flex;align-items:center;gap:8px
+  }
+  .sec-head:first-child{margin-top:0}
+  .sec-head .num{
+    width:20px;height:20px;border-radius:50%;background:var(--green-dim);
+    display:inline-flex;align-items:center;justify-content:center;font-size:10px;
+    color:var(--green);font-weight:700
+  }
+
+  .text-block{margin-bottom:1.4em}
+
+  .s{
+    font-size:var(--font-size);line-height:var(--line-height);display:inline;
+    transition:opacity .3s ease;opacity:var(--text-upcoming);color:var(--text)
+  }
+  .s.past{opacity:var(--text-dimmed)}
+  .s.cur{opacity:1;font-weight:500}
+  .s.up{opacity:var(--text-upcoming)}
+
+  .pause{
+    display:flex;align-items:center;gap:10px;margin:1.4em 0;padding:14px 18px;
+    background:var(--amber-dim);border-left:3px solid var(--amber);border-radius:0 var(--radius) var(--radius) 0;
+    font-size:14px;color:var(--amber);font-weight:500;transition:opacity .3s
+  }
+
+  .branch{
+    margin:1.4em 0;padding:18px;background:var(--blue-dim);
+    border-left:3px solid var(--blue);border-radius:0 var(--radius) var(--radius) 0
+  }
+  .branch-q{font-size:14px;color:var(--blue);margin-bottom:12px;font-weight:500}
+  .branch-opts{display:flex;gap:8px}
+  .branch-opt{
+    flex:1;padding:10px 16px;background:var(--surface);border:1px solid var(--border);
+    border-radius:var(--radius-sm);cursor:pointer;text-align:center;
+    font-size:14px;color:var(--text);font-weight:500;transition:all .15s
+  }
+  .branch-opt:hover{border-color:var(--blue);background:var(--blue-dim)}
+  .branch-opt.sel{border-color:var(--green);background:var(--green-dim);color:var(--green)}
+  .branch-opt:focus{outline:2px solid var(--blue);outline-offset:2px}
+  .branch-body{margin-top:14px;display:none}
+  .branch-body.show{display:block}
+  .branch-body .s{font-size:calc(var(--font-size)*.88)}
+
+  /* ── Empty state ── */
+  .empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;padding:48px}
+  .empty.hide{display:none}
+  .empty-icon{width:64px;height:64px;border-radius:16px;background:var(--surface);display:flex;align-items:center;justify-content:center;font-size:28px;border:1px solid var(--border)}
+  .empty h2{font-size:20px;font-weight:600;color:var(--text)}
+  .empty p{font-size:14px;color:var(--text-muted);text-align:center;max-width:340px;line-height:1.5}
+  .empty-btns{display:flex;gap:10px}
+  .btn-primary{
+    background:var(--green);border:none;color:#000;padding:10px 24px;
+    border-radius:var(--radius-sm);font-size:14px;font-weight:600;cursor:pointer;transition:opacity .15s
+  }
+  .btn-primary:hover{opacity:.88}
+  .btn-ghost{
+    background:none;border:1px solid var(--border);color:var(--text-secondary);
+    padding:10px 20px;border-radius:var(--radius-sm);font-size:14px;font-weight:500;cursor:pointer;transition:all .15s
+  }
+  .btn-ghost:hover{border-color:var(--text-muted);color:var(--text)}
+  .hint{font-size:11px;color:var(--text-muted);letter-spacing:.02em}
+  kbd{font-family:ui-monospace,monospace;font-size:.9em;padding:1px 5px;border-radius:3px;background:var(--surface);border:1px solid var(--border);color:var(--text-secondary)}
+
+  /* ── Start bar ── */
+  .start-bar{display:none;align-items:center;justify-content:center;gap:14px;padding:14px 24px;border-top:1px solid var(--border-subtle);background:var(--surface);flex-shrink:0}
+  .start-bar.show{display:flex}
+
+  /* ── Status bar ── */
+  .status{display:none;align-items:center;justify-content:space-between;padding:8px 20px;border-top:1px solid var(--border-subtle);background:var(--surface);flex-shrink:0;font-size:12px;color:var(--text-muted)}
+  .status.show{display:flex}
+  .status-l{display:flex;align-items:center;gap:10px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--text-muted);flex-shrink:0}
+  .dot.go{background:var(--green);box-shadow:0 0 6px rgba(34,197,94,.4);animation:pulse 2s ease infinite}
+  .dot.wait{background:var(--amber);animation:pulse 1.5s ease infinite}
+  .dot.stop{background:var(--text-muted)}
+  .dot.fin{background:var(--green)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .mic-level{width:3px;height:18px;background:var(--border);border-radius:2px;overflow:hidden}
+  .mic-fill{width:100%;background:var(--green);border-radius:2px;transition:height 80ms ease;position:relative;bottom:0}
+  .progress-bar{width:120px;height:3px;background:var(--border);border-radius:2px;overflow:hidden}
+  .progress-fill{height:100%;background:var(--green);border-radius:2px;transition:width .5s ease}
+  .status-r{display:flex;align-items:center;gap:6px}
+  .status-r button{
+    background:none;border:1px solid var(--border);color:var(--text-muted);
+    padding:2px 10px;border-radius:4px;font-size:11px;cursor:pointer;transition:all .12s
+  }
+  .status-r button:hover{border-color:var(--text-secondary);color:var(--text-secondary)}
+  .speed-group{display:flex;align-items:center;gap:4px}
+  .speed-group input[type=range]{width:64px;accent-color:var(--green);height:3px}
+  .speed-val{font-variant-numeric:tabular-nums;min-width:40px;font-size:11px}
+  .font-val{font-variant-numeric:tabular-nums;min-width:22px;text-align:center;font-size:11px}
+  .sep{width:1px;height:14px;background:var(--border);margin:0 4px}
+
+  /* ── Completion ── */
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.88);display:none;align-items:center;justify-content:center;z-index:50}
+  .overlay.show{display:flex}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:36px;max-width:420px;width:90%;text-align:center}
+  .card h2{font-size:24px;margin-bottom:4px;font-weight:600}
+  .card .sub{color:var(--text-muted);font-size:14px;margin-bottom:28px}
+  .card-rows{text-align:left;margin-bottom:24px}
+  .card-row{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border-subtle);font-size:14px}
+  .card-row:last-child{border:none}
+  .card-row .ck{font-size:16px;width:20px;text-align:center}
+  .card-row .nm{flex:1;color:var(--text-secondary)}
+  .card-row .tm{font-variant-numeric:tabular-nums;font-size:12px;color:var(--text-muted)}
+
+  /* ── Help ── */
+  .help{position:fixed;inset:0;background:rgba(0,0,0,.82);display:none;align-items:center;justify-content:center;z-index:60}
+  .help.show{display:flex}
+  .help-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:380px;width:90%}
+  .help-card h3{margin-bottom:18px;font-size:15px;font-weight:600}
+  .help-card table{width:100%;font-size:13px;border-spacing:0}
+  .help-card td{padding:5px 0;color:var(--text-secondary)}
+  .help-card td:first-child{color:var(--text);font-family:ui-monospace,monospace;width:72px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="titlebar"></div>
+<div class="error-bar" id="err"></div>
+<div class="nav" id="nav"></div>
+
+<div class="empty" id="empty">
+  <div class="empty-icon">&#x1F4CB;</div>
+  <h2>Load a consultation script</h2>
+  <p>Open a file, paste from your clipboard, or drop a .script.md file onto this window.</p>
+  <div class="empty-btns">
+    <button class="btn-primary" id="btnOpen">Open File</button>
+    <button class="btn-ghost" id="btnPaste">Paste Script</button>
+  </div>
+  <span class="hint"><kbd>&#8984;O</kbd> open &middot; <kbd>&#8984;V</kbd> paste &middot; drag &amp; drop</span>
+</div>
+
+<div class="tp" id="tp"></div>
+
+<div class="start-bar" id="startBar">
+  <button class="btn-primary" id="btnStart">Start Session</button>
+  <span class="hint">or press <kbd>Space</kbd></span>
+  <div style="flex:1"></div>
+  <button class="btn-ghost" id="btnClose" style="padding:8px 14px">Close</button>
+</div>
+
+<div class="status" id="status">
+  <div class="status-l">
+    <div class="dot" id="dot"></div>
+    <div class="mic-level" title="Mic level"><div class="mic-fill" id="micFill"></div></div>
+    <span id="stLabel">Ready</span>
+    <div class="sep"></div>
+    <div class="progress-bar"><div class="progress-fill" id="progFill" style="width:0%"></div></div>
+    <span id="stWords" style="font-variant-numeric:tabular-nums">0 / 0</span>
+    <div class="sep"></div>
+    <span id="stTime" style="font-variant-numeric:tabular-nums">0:00</span>
+  </div>
+  <div class="status-r">
+    <div class="speed-group">
+      <span class="speed-val" id="speedVal">150 wpm</span>
+      <input type="range" id="speedSlider" min="80" max="300" value="150" step="10">
+    </div>
+    <div class="sep"></div>
+    <button id="btnFontDown">A&#x2212;</button>
+    <span class="font-val" id="fontVal">26</span>
+    <button id="btnFontUp">A+</button>
+    <div class="sep"></div>
+    <button id="btnHelp">?</button>
+  </div>
+</div>
+
+<div class="overlay" id="doneOverlay"><div class="card" id="doneCard"></div></div>
+
+<div class="help" id="helpOverlay">
+  <div class="help-card" id="helpCard">
+    <h3>Keyboard Shortcuts</h3>
+    <table>
+      <tr><td>Space</td><td>Start / Pause / Resume</td></tr>
+      <tr><td>&#x2191; &#x2193;</td><td>Previous / Next sentence</td></tr>
+      <tr><td>1 &ndash; 9</td><td>Jump to section</td></tr>
+      <tr><td>Tab</td><td>Cycle branch options</td></tr>
+      <tr><td>Enter</td><td>Select branch option</td></tr>
+      <tr><td>+ / &ndash;</td><td>Font size</td></tr>
+      <tr><td>&#8984;O</td><td>Open file</td></tr>
+      <tr><td>&#8984;V</td><td>Paste script</td></tr>
+      <tr><td>H</td><td>This help</td></tr>
+      <tr><td>Esc</td><td>End session</td></tr>
+    </table>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════
+//  Prompter — teleprompter engine
+//  All DOM mutations use safe createElement / textContent.
+//  Script data is first-party from our own Rust parser via Tauri IPC.
+// ═══════════════════════════════════════════════════════════
+
+const { invoke } = window.__TAURI__.core;
+const { open } = window.__TAURI__.dialog;
+const { listen } = window.__TAURI__.event;
+
+// Audio mode: when mic is active, VAD controls scroll instead of timer
+let audioMode = false;
+let vadSpeaking = false;
+let vadAdvanceTimer = null;  // accumulates speaking time to advance sentences
+
+// ── State ──
+let script = null;
+let items = [];          // flat array of {text, words, section, kind:'s'|'p'}
+let idx = 0;
+let state = 'idle';      // idle | loaded | run | pause | wait | done
+let speed = 150;
+let fontSize = 26;
+let timer = null;
+let clockId = null;
+let t0 = null;
+let secTimes = {};
+
+// ── DOM refs ──
+const $=id=>document.getElementById(id);
+const els = {};
+function initRefs(){
+  ['err','nav','empty','tp','startBar','status','dot','micFill','stLabel',
+   'progFill','stWords','stTime','speedVal','speedSlider','fontVal',
+   'doneOverlay','doneCard','helpOverlay','helpCard',
+   'btnOpen','btnPaste','btnStart','btnClose','btnFontDown','btnFontUp','btnHelp'
+  ].forEach(id=>{els[id]=$(id)});
+}
+
+// ── Boot ──
+document.addEventListener('DOMContentLoaded', ()=>{
+  initRefs();
+  els.btnOpen.addEventListener('click', openFile);
+  els.btnPaste.addEventListener('click', pasteScript);
+  els.btnStart.addEventListener('click', startSession);
+  els.btnClose.addEventListener('click', resetAll);
+  els.btnFontDown.addEventListener('click', ()=>setFont(-2));
+  els.btnFontUp.addEventListener('click', ()=>setFont(2));
+  els.btnHelp.addEventListener('click', toggleHelp);
+  els.helpOverlay.addEventListener('click', toggleHelp);
+  els.helpCard.addEventListener('click', e=>e.stopPropagation());
+  els.speedSlider.addEventListener('input', e=>{
+    speed = +e.target.value;
+    els.speedVal.textContent = speed+' wpm';
+    if(state==='run'){stopScroll();startScroll()}
+  });
+  // Drag-and-drop on the whole window
+  document.addEventListener('dragover', e=>{e.preventDefault();e.stopPropagation()});
+  document.addEventListener('drop', handleDrop);
+});
+
+// ── File open ──
+async function openFile(){
+  try{
+    const p = await open({filters:[{name:'Script',extensions:['md','txt','script.md']}],multiple:false});
+    if(p){const d=await invoke('load_script',{path:p});loadScript(d)}
+  }catch(e){showErr(String(e))}
+}
+
+// ── Paste ──
+async function pasteScript(){
+  try{
+    const txt = await navigator.clipboard.readText();
+    if(!txt||!txt.trim()){showErr('Clipboard is empty');return}
+    const d = await invoke('parse_script_text',{text:txt});
+    loadScript(d);
+  }catch(e){showErr('Paste failed: '+String(e))}
+}
+
+// ── Drag-and-drop ──
+async function handleDrop(e){
+  e.preventDefault(); e.stopPropagation();
+  // Tauri v2: files come from the dataTransfer
+  const files = e.dataTransfer?.files;
+  if(files && files.length > 0){
+    // In Tauri webview, we can read the file path from the File object name
+    // But File API doesn't give us the full path in webview. Use text content instead.
+    const file = files[0];
+    try{
+      const txt = await file.text();
+      const d = await invoke('parse_script_text',{text:txt});
+      loadScript(d);
+    }catch(err){showErr('Could not load dropped file: '+String(err))}
+  }
+}
+
+// ── Load script ──
+function loadScript(data){
+  script = data;
+  hideErr();
+  stopScroll(); stopClock();
+  state = 'loaded';
+  items = [];
+  data.sections.forEach((sec,si)=>{
+    sec.elements.forEach(el=>{
+      if(el.type==='text') el.sentences.forEach(s=>items.push({text:s.text,words:s.word_count,section:si,kind:'s'}));
+      else if(el.type==='pause') items.push({text:el.prompt,words:0,section:si,kind:'p'});
+    });
+  });
+  idx=0; secTimes={};
+  buildNav(); buildTP();
+  highlight();
+  show('nav'); show('startBar'); show('tp');
+  hide('empty'); hide('status'); hide('doneOverlay');
+}
+
+// ── Session lifecycle ──
+async function startSession(){
+  if(state!=='loaded')return;
+  state='run'; t0=Date.now(); secTimes={0:Date.now()};
+  hide('startBar'); show('status');
+
+  // Try to start audio capture for VAD-controlled scroll
+  try{
+    await invoke('start_audio');
+    audioMode = true;
+    setupVadListener();
+  }catch(e){
+    // No mic? Fall back to timer-based scroll
+    audioMode = false;
+    startScroll();
+  }
+
+  updateSt(); startClock();
+}
+function resetAll(){
+  stopScroll(); stopClock(); cleanupVad();
+  script=null; items=[]; idx=0; state='idle';
+  hide('nav'); hide('tp'); hide('startBar'); hide('status'); hide('doneOverlay');
+  show('empty');
+}
+
+// ── Auto-scroll ──
+function startScroll(){
+  stopScroll();
+  if(state!=='run')return;
+  scheduleNext();
+}
+function stopScroll(){if(timer){clearTimeout(timer);timer=null}}
+function scheduleNext(){
+  if(state!=='run'||idx>=items.length)return;
+  const w = items[idx].words||4;
+  const ms = w * (60000/speed);
+  timer = setTimeout(()=>{
+    if(state!=='run')return;
+    if(idx>=items.length-1){endSession();return}
+    idx++;
+    trackSection();
+    if(items[idx]?.kind==='p'){state='wait';updateSt();highlight();return}
+    highlight(); scheduleNext();
+  }, ms);
+}
+function trackSection(){
+  const si=items[idx]?.section;
+  if(si!==undefined && secTimes[si]===undefined) secTimes[si]=Date.now();
+}
+
+// ── VAD-controlled scroll ──
+let vadUnlisten = null;
+let vadWordAccum = 0;  // accumulate "spoken words" based on speaking time
+
+function setupVadListener(){
+  if(vadUnlisten) return;
+  listen('vad', (event)=>{
+    const {speaking, silence_ms, level} = event.payload;
+    vadSpeaking = speaking;
+
+    // Update mic level indicator
+    const fill = els.micFill;
+    if(fill) fill.style.height = Math.min(level, 100)+'%';
+
+    if(state!=='run' && state!=='wait') return;
+
+    if(speaking && state==='run'){
+      // Accumulate "speaking time" — each VAD tick is ~100ms
+      // At 150 WPM, that's 2.5 words/sec, so ~0.25 words per 100ms tick
+      vadWordAccum += speed / 600; // words per 100ms at current WPM
+
+      // Advance when we've accumulated enough words for the current sentence
+      const currentWords = items[idx]?.words || 5;
+      if(vadWordAccum >= currentWords){
+        vadWordAccum -= currentWords;
+        if(idx < items.length - 1){
+          idx++; trackSection();
+          if(items[idx]?.kind==='p'){state='wait';updateSt();highlight();return}
+          highlight();
+        } else {
+          endSession();
+        }
+      }
+    } else if(!speaking && state==='wait'){
+      // At a pause marker and silence detected — this is expected
+      // (patient is about to respond, or pharmacist paused for them)
+    }
+  }).then(fn => { vadUnlisten = fn });
+
+  listen('vad-error', (event)=>{
+    audioMode = false;
+    startScroll(); // fall back to timer
+  }).then(()=>{});
+}
+
+function cleanupVad(){
+  if(vadUnlisten){vadUnlisten();vadUnlisten=null}
+  vadWordAccum = 0;
+  invoke('stop_audio').catch(()=>{});
+  audioMode = false;
+}
+
+// ── Pause / resume ──
+function toggle(){
+  if(state==='run'){
+    state='pause';
+    if(!audioMode) stopScroll();
+    // In audio mode, VAD events just won't advance while paused
+  }
+  else if(state==='pause'||state==='wait'){
+    state='run';
+    if(items[idx]?.kind==='p' && idx<items.length-1){idx++;highlight()}
+    if(!audioMode) startScroll();
+    vadWordAccum = 0; // reset accumulator on resume
+  }
+  else if(state==='loaded'){startSession();return}
+  updateSt();
+}
+
+// ── End session ──
+function endSession(){
+  state='done'; stopScroll(); stopClock(); cleanupVad(); updateSt();
+  const elapsed = t0 ? Math.floor((Date.now()-t0)/1000) : 0;
+  const card = els.doneCard;
+  while(card.firstChild) card.removeChild(card.firstChild);
+
+  const h = document.createElement('h2');
+  h.textContent = 'Great consultation'; card.appendChild(h);
+
+  const sub = document.createElement('div');
+  sub.className='sub';
+  sub.textContent = fmt(elapsed)+' total'; card.appendChild(sub);
+
+  const rows = document.createElement('div');
+  rows.className='card-rows';
+  script.sections.forEach((sec,i)=>{
+    const row=document.createElement('div'); row.className='card-row';
+    const ck=document.createElement('span'); ck.className='ck';
+    const reached = items.some(it=>it.section===i && items.indexOf(it)<=idx);
+    ck.textContent = reached?'\u2713':'\u2013';
+    if(!reached) ck.style.opacity='.3';
+    else ck.style.color='var(--green)';
+    const nm=document.createElement('span'); nm.className='nm'; nm.textContent=sec.name;
+    const tm=document.createElement('span'); tm.className='tm';
+    if(secTimes[i]!==undefined){
+      const next=secTimes[i+1]||Date.now();
+      tm.textContent=fmt(Math.floor((next-secTimes[i])/1000));
+    }
+    row.appendChild(ck); row.appendChild(nm); row.appendChild(tm);
+    rows.appendChild(row);
+  });
+  card.appendChild(rows);
+
+  const btn=document.createElement('button');
+  btn.className='btn-primary'; btn.textContent='Done';
+  btn.addEventListener('click', resetAll);
+  card.appendChild(btn);
+
+  show('doneOverlay');
+}
+
+// ── Navigation ──
+function advance(){
+  if(idx<items.length-1){idx++;trackSection();highlight()}
+  else if(state==='run') endSession();
+}
+function retreat(){if(idx>0){idx--;highlight()}}
+function jumpSec(si){
+  const i=items.findIndex(it=>it.section===si);
+  if(i>=0){idx=i;if(!secTimes[si])secTimes[si]=Date.now();highlight();$(('sec-'+si)).scrollIntoView({behavior:'smooth'})}
+}
+
+// ── Build nav ──
+function buildNav(){
+  const nav=els.nav;
+  while(nav.firstChild) nav.removeChild(nav.firstChild);
+  script.sections.forEach((sec,i)=>{
+    const b=document.createElement('button');
+    b.dataset.si=i; b.textContent=sec.name;
+    b.addEventListener('click',()=>jumpSec(i));
+    nav.appendChild(b);
+  });
+}
+
+// ── Build teleprompter ──
+function buildTP(){
+  const tp=els.tp;
+  while(tp.firstChild) tp.removeChild(tp.firstChild);
+  let sentenceIndex=0;
+
+  script.sections.forEach((sec,si)=>{
+    const hd=document.createElement('div');
+    hd.className='sec-head'; hd.id='sec-'+si;
+    const num=document.createElement('span'); num.className='num'; num.textContent=si+1;
+    const label=document.createElement('span'); label.textContent=sec.name;
+    hd.appendChild(num); hd.appendChild(label);
+    tp.appendChild(hd);
+
+    sec.elements.forEach(el=>{
+      if(el.type==='text'){
+        const blk=document.createElement('div'); blk.className='text-block';
+        el.sentences.forEach(s=>{
+          const sp=document.createElement('span');
+          sp.className='s'; sp.dataset.i=sentenceIndex;
+          sp.textContent=s.text+' ';
+          blk.appendChild(sp);
+          sentenceIndex++;
+        });
+        tp.appendChild(blk);
+      } else if(el.type==='pause'){
+        const m=document.createElement('div');
+        m.className='pause'; m.dataset.i=sentenceIndex;
+        const ic=document.createElement('span'); ic.textContent='\u23F8';
+        const tx=document.createElement('span'); tx.textContent=el.prompt;
+        m.appendChild(ic); m.appendChild(tx);
+        tp.appendChild(m);
+        sentenceIndex++;
+      } else if(el.type==='branch'){
+        const c=document.createElement('div'); c.className='branch';
+        const q=document.createElement('div'); q.className='branch-q'; q.textContent=el.question;
+        c.appendChild(q);
+        const opts=document.createElement('div'); opts.className='branch-opts';
+        el.options.forEach((opt,oi)=>{
+          const btn=document.createElement('button');
+          btn.className='branch-opt'; btn.textContent=opt.label; btn.tabIndex=0;
+          btn.addEventListener('click',()=>{
+            opts.querySelectorAll('.branch-opt').forEach(b=>b.classList.remove('sel'));
+            btn.classList.add('sel');
+            c.querySelectorAll('.branch-body').forEach(b=>b.classList.remove('show'));
+            const target=c.querySelector('[data-bo="'+si+'-'+oi+'"]');
+            if(target) target.classList.add('show');
+          });
+          opts.appendChild(btn);
+        });
+        c.appendChild(opts);
+        el.options.forEach((opt,oi)=>{
+          const body=document.createElement('div');
+          body.className='branch-body'; body.dataset.bo=si+'-'+oi;
+          opt.sentences.forEach(s=>{
+            const sp=document.createElement('span');
+            sp.className='s up'; sp.textContent=s.text+' ';
+            body.appendChild(sp);
+          });
+          c.appendChild(body);
+        });
+        tp.appendChild(c);
+      }
+    });
+  });
+}
+
+// ── Highlight ──
+function highlight(){
+  document.querySelectorAll('.s[data-i]').forEach(el=>{
+    const i=+el.dataset.i;
+    el.classList.remove('past','cur','up');
+    if(i<idx) el.classList.add('past');
+    else if(i===idx) el.classList.add('cur');
+    else el.classList.add('up');
+  });
+  const cur=document.querySelector('.s.cur');
+  if(cur) cur.scrollIntoView({behavior:'smooth',block:'center'});
+
+  document.querySelectorAll('.pause[data-i]').forEach(el=>{
+    const i=+el.dataset.i;
+    el.style.opacity = i===idx?'1': i<idx?'.25':'.65';
+    if(i===idx) el.scrollIntoView({behavior:'smooth',block:'center'});
+  });
+
+  updateNav(); updateProgress();
+}
+
+function updateNav(){
+  if(!items.length)return;
+  const si=items[idx]?.section??0;
+  els.nav.querySelectorAll('button').forEach(b=>{
+    const i=+b.dataset.si;
+    b.classList.remove('active','done');
+    if(i===si) b.classList.add('active');
+    else if(i<si) b.classList.add('done');
+  });
+}
+
+function updateProgress(){
+  if(!script)return;
+  let read=0;
+  for(let i=0;i<idx&&i<items.length;i++) read+=items[i].words||0;
+  const pct=script.word_count?Math.round(read/script.word_count*100):0;
+  els.progFill.style.width=pct+'%';
+  els.stWords.textContent=read+' / '+script.word_count;
+}
+
+function updateSt(){
+  const d=els.dot, l=els.stLabel;
+  d.className='dot';
+  switch(state){
+    case 'run': d.classList.add('go'); l.textContent=audioMode?(vadSpeaking?'Speaking\u2026':'Listening\u2026'):'Auto-scrolling\u2026'; break;
+    case 'pause': d.classList.add('stop'); l.textContent='Paused'; break;
+    case 'wait': d.classList.add('wait'); l.textContent='Waiting for response\u2026'; break;
+    case 'done': d.classList.add('fin'); l.textContent='Complete'; break;
+    default: l.textContent='Ready';
+  }
+}
+
+// ── Clock ──
+function startClock(){
+  stopClock();
+  clockId=setInterval(()=>{
+    if(!t0)return;
+    els.stTime.textContent=fmt(Math.floor((Date.now()-t0)/1000));
+  },1000);
+}
+function stopClock(){if(clockId){clearInterval(clockId);clockId=null}}
+
+// ── Font size ──
+function setFont(d){
+  fontSize=Math.max(16,Math.min(44,fontSize+d));
+  document.documentElement.style.setProperty('--font-size',fontSize+'px');
+  els.fontVal.textContent=fontSize;
+}
+
+// ── Help ──
+function toggleHelp(){els.helpOverlay.classList.toggle('show')}
+
+// ── Error ──
+function showErr(msg){
+  const e=els.err;
+  while(e.firstChild) e.removeChild(e.firstChild);
+  const t=document.createElement('span'); t.textContent=msg; t.style.flex='1';
+  const x=document.createElement('button'); x.className='dismiss'; x.textContent='\u2715';
+  x.addEventListener('click', hideErr);
+  e.appendChild(t); e.appendChild(x);
+  e.classList.add('show');
+}
+function hideErr(){els.err.classList.remove('show')}
+
+// ── Utilities ──
+function show(id){const e=els[id];e.classList.add('show');e.classList.remove('hide')}
+function hide(id){const e=els[id];e.classList.remove('show');e.classList.add('hide')}
+function fmt(sec){const m=Math.floor(sec/60),s=sec%60;return m+':'+String(s).padStart(2,'0')}
+
+// ── Keyboard ──
+document.addEventListener('keydown', e=>{
+  if((e.metaKey||e.ctrlKey)&&e.key==='v'&&!script){e.preventDefault();pasteScript();return}
+  if((e.metaKey||e.ctrlKey)&&e.key==='o'){e.preventDefault();openFile();return}
+  if(els.helpOverlay.classList.contains('show')){
+    if(e.key==='Escape'||e.key==='h'||e.key==='H') toggleHelp();
+    return;
+  }
+  switch(e.key){
+    case ' ':e.preventDefault();if(script)toggle();break;
+    case 'ArrowDown':e.preventDefault();if(script&&state!=='idle'){
+      if(state==='run')stopScroll(); advance(); if(state==='run')startScroll();
+    }break;
+    case 'ArrowUp':e.preventDefault();if(script){
+      if(state==='run')stopScroll(); retreat(); if(state==='run')startScroll();
+    }break;
+    case 'Escape':
+      if(state==='run'||state==='pause'||state==='wait') endSession();
+      break;
+    case '+':case '=':setFont(2);break;
+    case '-':case '_':setFont(-2);break;
+    case 'h':case 'H':toggleHelp();break;
+    case 'Tab':
+      e.preventDefault();
+      const bc=document.querySelector('.branch');
+      if(bc){
+        const os=bc.querySelectorAll('.branch-opt');
+        const s=bc.querySelector('.branch-opt.sel');
+        if(!s&&os.length) os[0].focus();
+        else if(s){const i=Array.from(os).indexOf(s);os[(i+1)%os.length].focus()}
+      }
+      break;
+    case 'Enter':
+      if(document.activeElement?.classList.contains('branch-opt')) document.activeElement.click();
+      break;
+    default:
+      const n=parseInt(e.key);
+      if(n>=1&&n<=9&&script&&n<=script.sections.length) jumpSec(n-1);
+  }
+});
+</script>
+</body>
+</html>
