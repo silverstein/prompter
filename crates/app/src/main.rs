@@ -450,9 +450,106 @@ fn list_available_scripts() -> Vec<RecentScript> {
     results
 }
 
+/// Find a script file by consultation_id in the watched folder.
+fn find_script_by_consultation_id(consultation_id: &str) -> Option<String> {
+    let home = dirs_next::home_dir()?;
+    let scripts_dir = home.join("meetings").join("scripts");
+
+    if let Ok(entries) = fs::read_dir(&scripts_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            // Check filename contains the consultation_id
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.contains(consultation_id) {
+                    return Some(path.to_string_lossy().to_string());
+                }
+            }
+            // Also check frontmatter for consultation_id field
+            if let Ok(content) = fs::read_to_string(&path) {
+                if content.contains(&format!("consultation_id: \"{}\"", consultation_id))
+                    || content.contains(&format!("consultation_id: {}", consultation_id))
+                {
+                    return Some(path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse a deep link URL and extract parameters.
+/// Supports: prompter://open?file=/path/to/script.md
+///           prompter://open?consultation_id=abc-123
+fn parse_deep_link(url: &str) -> Option<(String, String)> {
+    // Strip the scheme
+    let rest = url.strip_prefix("prompter://").unwrap_or(url);
+    let rest = rest.strip_prefix("open").unwrap_or(rest);
+    let rest = rest.strip_prefix('?').unwrap_or(rest);
+
+    for param in rest.split('&') {
+        if let Some((key, value)) = param.split_once('=') {
+            let value = urlencoding_decode(value);
+            return Some((key.to_string(), value));
+        }
+    }
+    None
+}
+
+/// Simple URL decoding (handles %20, %2F, etc.)
+fn urlencoding_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                result.push(byte as char);
+            }
+        } else if c == '+' {
+            result.push(' ');
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_deep_link::init())
+        .setup(|app| {
+            use tauri::Listener;
+            // Handle deep links (prompter://open?file=... or prompter://open?consultation_id=...)
+            let handle = app.handle().clone();
+            app.handle().listen("deep-link://new-url", move |event| {
+                let payload = event.payload();
+                if let Ok(urls) = serde_json::from_str::<Vec<String>>(payload) {
+                    for url in urls {
+                        if let Some((key, value)) = parse_deep_link(&url) {
+                            match key.as_str() {
+                                "file" => {
+                                    let _ = handle.emit("deep-link-open", value);
+                                }
+                                "consultation_id" => {
+                                    if let Some(path) = find_script_by_consultation_id(&value) {
+                                        let _ = handle.emit("deep-link-open", path);
+                                    } else {
+                                        let _ = handle.emit("deep-link-error",
+                                            format!("No script found for consultation {}", value));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             load_script,
             parse_script_text,

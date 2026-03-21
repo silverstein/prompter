@@ -337,6 +337,15 @@ document.addEventListener('DOMContentLoaded', ()=>{
   // Restore settings + load recents
   restoreSettings();
   loadRecents();
+  // Listen for deep link opens (prompter://open?file=... or ?consultation_id=...)
+  listen('deep-link-open', async (event)=>{
+    try{
+      const d = await invoke('load_script',{path:event.payload});
+      loadScript(d);
+      invoke('add_recent_script',{path:event.payload,title:d.title}).catch(()=>{});
+    }catch(e){ showErr('Deep link: '+e) }
+  }).then(()=>{});
+  listen('deep-link-error', (event)=>{ showErr(event.payload) }).then(()=>{});
 });
 
 // ── File open ──
