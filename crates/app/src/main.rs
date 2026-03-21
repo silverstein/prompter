@@ -205,6 +205,48 @@ fn stop_audio() -> Result<(), String> {
     Ok(())
 }
 
+/// Save compliance report after session ends.
+#[derive(serde::Deserialize)]
+struct SessionReport {
+    script_title: String,
+    script_version: Option<String>,
+    sections_covered: Vec<String>,
+    sections_skipped: Vec<String>,
+    duration_secs: u64,
+    section_times: std::collections::HashMap<String, u64>,
+    pause_points_reached: usize,
+    pause_points_total: usize,
+    branches_taken: std::collections::HashMap<String, String>,
+    total_words: usize,
+    words_delivered: usize,
+}
+
+#[tauri::command]
+fn save_compliance(report: SessionReport) -> Result<String, String> {
+    let compliance = prompter_core::ComplianceReport {
+        script_title: report.script_title,
+        script_version: report.script_version,
+        sections_covered: report.sections_covered,
+        sections_skipped: report.sections_skipped,
+        duration_secs: report.duration_secs,
+        section_times: report.section_times,
+        pause_points_reached: report.pause_points_reached,
+        pause_points_total: report.pause_points_total,
+        branches_taken: report.branches_taken,
+        total_words: report.total_words,
+        words_delivered: report.words_delivered,
+    };
+
+    let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = home.join("meetings").join("consults");
+
+    let path = compliance
+        .write_to_dir(&dir)
+        .map_err(|e| format!("Failed to save compliance report: {}", e))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -212,7 +254,8 @@ fn main() {
             load_script,
             parse_script_text,
             start_audio,
-            stop_audio
+            stop_audio,
+            save_compliance
         ])
         .run(tauri::generate_context!())
         .expect("error while running Prompter");

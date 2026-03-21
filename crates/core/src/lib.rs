@@ -1,3 +1,4 @@
+pub mod compliance;
 pub mod error;
 pub mod script;
 
@@ -6,6 +7,7 @@ pub mod audio;
 #[cfg(feature = "audio")]
 pub mod vad;
 
+pub use compliance::ComplianceReport;
 pub use error::{ParseError, PrompterError};
 pub use script::{BranchOption, Directive, Frontmatter, Script, Section, Sentence};
 

@@ -523,6 +523,47 @@ function endSession(){
   });
   card.appendChild(rows);
 
+  // Save compliance report
+  const covered = [];
+  const skipped = [];
+  const sectionTimesMap = {};
+  let wordsDelivered = 0;
+  let pauseReached = 0;
+  const pauseTotal = items.filter(it=>it.kind==='p').length;
+
+  script.sections.forEach((sec,i)=>{
+    const reached = items.some(it=>it.section===i && items.indexOf(it)<=idx);
+    if(reached) covered.push(sec.name); else skipped.push(sec.name);
+    if(secTimes[i]!==undefined){
+      const next = secTimes[i+1]||Date.now();
+      sectionTimesMap[sec.name] = Math.floor((next-secTimes[i])/1000);
+    }
+  });
+  for(let i=0;i<idx&&i<items.length;i++){
+    wordsDelivered += items[i].words||0;
+    if(items[i].kind==='p') pauseReached++;
+  }
+
+  invoke('save_compliance', { report: {
+    script_title: script.title,
+    script_version: script.version || null,
+    sections_covered: covered,
+    sections_skipped: skipped,
+    duration_secs: elapsed,
+    section_times: sectionTimesMap,
+    pause_points_reached: pauseReached,
+    pause_points_total: pauseTotal,
+    branches_taken: {},
+    total_words: script.word_count,
+    words_delivered: wordsDelivered
+  }}).then(path => {
+    // Show saved path
+    const saved = document.createElement('div');
+    saved.style.cssText = 'font-size:12px;color:var(--text-muted);margin-top:12px';
+    saved.textContent = 'Report saved to '+path;
+    card.appendChild(saved);
+  }).catch(()=>{});
+
   const btn=document.createElement('button');
   btn.className='btn-primary'; btn.textContent='Done';
   btn.addEventListener('click', resetAll);
