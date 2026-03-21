@@ -1,3 +1,4 @@
+pub mod align;
 pub mod compliance;
 pub mod error;
 pub mod script;
@@ -7,6 +8,7 @@ pub mod audio;
 #[cfg(feature = "audio")]
 pub mod vad;
 
+pub use align::{AlignResult, AlignmentEngine};
 pub use compliance::ComplianceReport;
 pub use error::{ParseError, PrompterError};
 pub use script::{BranchOption, Directive, Frontmatter, Script, Section, Sentence};
@@ -15,3 +17,8 @@ pub use script::{BranchOption, Directive, Frontmatter, Script, Section, Sentence
 pub use audio::{AudioChunk, AudioStream};
 #[cfg(feature = "audio")]
 pub use vad::{Vad, VadResult};
+
+#[cfg(feature = "whisper")]
+pub mod transcribe;
+#[cfg(feature = "whisper")]
+pub use transcribe::StreamingTranscriber;

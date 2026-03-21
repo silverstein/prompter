@@ -404,10 +404,13 @@ async function startSession(){
   hide('startBar'); show('status');
 
   // Try to start audio capture for VAD-controlled scroll
+  // Send script sentences for Tier 2 alignment
+  const sentences = items.filter(it=>it.kind==='s').map(it=>it.text);
   try{
-    await invoke('start_audio');
+    await invoke('start_audio', { sentences });
     audioMode = true;
     setupVadListener();
+    setupAlignListener();
   }catch(e){
     // No mic? Fall back to timer-based scroll
     audioMode = false;
@@ -493,9 +496,44 @@ function setupVadListener(){
   }).then(()=>{});
 }
 
+// ── Tier 2: alignment listener ──
+let alignUnlisten = null;
+let tier2Active = false;
+
+function setupAlignListener(){
+  listen('tier2-ready', ()=>{ tier2Active = true; }).then(()=>{});
+
+  listen('align', (event)=>{
+    const {position, confidence, ad_libbing} = event.payload;
+    if(state!=='run' && state!=='wait') return;
+    if(!tier2Active) return;
+
+    // Only correct if confident and position is ahead of current
+    // (prevent jumping backward from noisy recognition)
+    if(confidence > 0.4 && position > idx){
+      // Map alignment position (sentence-only index) back to items index
+      let sentenceCount = 0;
+      for(let i=0; i<items.length; i++){
+        if(items[i].kind==='s'){
+          if(sentenceCount === position){
+            idx = i;
+            trackSection();
+            highlight();
+            vadWordAccum = 0;
+            break;
+          }
+          sentenceCount++;
+        }
+      }
+    }
+  }).then(fn => { alignUnlisten = fn });
+}
+
 function cleanupVad(){
   if(vadUnlisten){vadUnlisten();vadUnlisten=null}
+  if(alignUnlisten){alignUnlisten();alignUnlisten=null}
   vadWordAccum = 0;
+  tier2Active = false;
   invoke('stop_audio').catch(()=>{});
   audioMode = false;
 }

@@ -139,21 +139,32 @@ struct VadEvent {
     level: u32,
 }
 
-/// Start audio capture + VAD. Emits "vad" events to the frontend.
+/// Alignment correction event — tells frontend to jump to a position.
+#[derive(Clone, Serialize)]
+struct AlignEvent {
+    position: usize,
+    confidence: f32,
+    ad_libbing: bool,
+}
+
+/// Start audio capture + VAD + Tier 2 alignment.
+/// `sentences` is the flat list of script sentences for alignment matching.
 #[tauri::command]
-fn start_audio(app: tauri::AppHandle) -> Result<String, String> {
+fn start_audio(app: tauri::AppHandle, sentences: Vec<String>) -> Result<String, String> {
     if AUDIO_RUNNING.load(Ordering::Relaxed) {
         return Err("Audio already running".into());
     }
 
-    // Reset stop flag
     AUDIO_STOP.store(false, Ordering::Relaxed);
     AUDIO_RUNNING.store(true, Ordering::Relaxed);
 
     let stop = Arc::clone(&AUDIO_STOP);
 
-    // Spawn a dedicated thread that owns the AudioStream (which is !Send)
-    // This thread creates the stream, runs VAD, and emits events.
+    // Try to load whisper model for Tier 2 tracking
+    let model_path = dirs_next::home_dir()
+        .unwrap_or_default()
+        .join(".config/minutes/models/ggml-tiny.bin");
+
     std::thread::spawn(move || {
         let stream = match prompter_core::AudioStream::start() {
             Ok(s) => s,
@@ -166,8 +177,22 @@ fn start_audio(app: tauri::AppHandle) -> Result<String, String> {
 
         let _ = app.emit("audio-started", &stream.device_name);
 
+        // Initialize Tier 2 (optional — degrades gracefully if no model)
+        let mut transcriber = prompter_core::StreamingTranscriber::new(&model_path).ok();
+        let mut aligner = if !sentences.is_empty() {
+            Some(prompter_core::AlignmentEngine::new(sentences))
+        } else {
+            None
+        };
+
+        if transcriber.is_some() {
+            let _ = app.emit("tier2-ready", true);
+        }
+
         let rx = stream.receiver.clone();
         let mut vad = Vad::new();
+        let mut speech_buffer: Vec<f32> = Vec::new();
+        let mut was_speaking = false;
 
         loop {
             if stop.load(Ordering::Relaxed) {
@@ -177,6 +202,8 @@ fn start_audio(app: tauri::AppHandle) -> Result<String, String> {
             match rx.recv_timeout(std::time::Duration::from_millis(150)) {
                 Ok(chunk) => {
                     let result = vad.process(chunk.rms);
+
+                    // Emit VAD event (Tier 1)
                     let _ = app.emit(
                         "vad",
                         VadEvent {
@@ -185,6 +212,50 @@ fn start_audio(app: tauri::AppHandle) -> Result<String, String> {
                             level: (result.energy * 2000.0).min(100.0) as u32,
                         },
                     );
+
+                    // Tier 2: accumulate speech samples, transcribe on silence boundary
+                    if result.speaking {
+                        speech_buffer.extend_from_slice(&chunk.samples);
+                        was_speaking = true;
+
+                        // Cap buffer at ~10 seconds to prevent OOM
+                        if speech_buffer.len() > 160000 {
+                            // Transcribe what we have and reset
+                            if let (Some(ref mut t), Some(ref mut a)) = (&mut transcriber, &mut aligner) {
+                                if let Ok(text) = t.transcribe_chunk(&speech_buffer) {
+                                    if !text.is_empty() {
+                                        let ar = a.align(&text);
+                                        let _ = app.emit("align", AlignEvent {
+                                            position: ar.position,
+                                            confidence: ar.confidence,
+                                            ad_libbing: ar.ad_libbing,
+                                        });
+                                    }
+                                }
+                            }
+                            speech_buffer.clear();
+                        }
+                    } else if was_speaking && result.silence_ms >= 300 {
+                        // Speech just ended — transcribe the accumulated buffer
+                        was_speaking = false;
+
+                        if speech_buffer.len() >= 8000 {
+                            // At least 0.5s of audio
+                            if let (Some(ref mut t), Some(ref mut a)) = (&mut transcriber, &mut aligner) {
+                                if let Ok(text) = t.transcribe_chunk(&speech_buffer) {
+                                    if !text.is_empty() {
+                                        let ar = a.align(&text);
+                                        let _ = app.emit("align", AlignEvent {
+                                            position: ar.position,
+                                            confidence: ar.confidence,
+                                            ad_libbing: ar.ad_libbing,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        speech_buffer.clear();
+                    }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,

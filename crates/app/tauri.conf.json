@@ -6,6 +6,11 @@
   "build": {
     "frontendDist": "./ui"
   },
+  "bundle": {
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    }
+  },
   "app": {
     "withGlobalTauri": true,
     "windows": [
