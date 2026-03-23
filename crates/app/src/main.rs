@@ -151,9 +151,19 @@ struct AlignEvent {
 /// `sentences` is the flat list of script sentences for alignment matching.
 #[tauri::command]
 fn start_audio(app: tauri::AppHandle, sentences: Vec<String>) -> Result<String, String> {
-    // Atomic check-and-set to prevent race condition on double-start
+    // Wait briefly for previous audio thread to finish (e.g., mic test → session transition)
+    for _ in 0..10 {
+        if AUDIO_RUNNING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     if AUDIO_RUNNING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-        return Err("Audio already running".into());
+        // Already running and couldn't acquire — force stop and retry
+        AUDIO_STOP.store(true, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        AUDIO_RUNNING.store(false, Ordering::SeqCst);
+        AUDIO_RUNNING.store(true, Ordering::SeqCst);
     }
 
     AUDIO_STOP.store(false, Ordering::SeqCst);
@@ -337,7 +347,7 @@ struct Settings {
     recent_scripts: Vec<RecentScript>,
 }
 
-fn default_font_size() -> u32 { 26 }
+fn default_font_size() -> u32 { 34 }
 fn default_speed() -> u32 { 150 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]

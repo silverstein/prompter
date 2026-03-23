@@ -24,7 +24,7 @@
     --blue-dim: rgba(59,130,246,0.10);
     --red: #ef4444;
     --red-dim: rgba(239,68,68,0.10);
-    --font-size: 26px;
+    --font-size: 34px;
     --line-height: 1.65;
     --title-bar-h: 28px;
     --radius: 10px;
@@ -80,19 +80,19 @@
 
   .s{
     font-size:var(--font-size);line-height:var(--line-height);display:inline;
-    transition:all .3s ease;opacity:0.3;color:var(--text);
-    padding:2px 0;border-radius:3px;
+    transition:all .25s ease;opacity:0.25;color:var(--text-muted);
+    padding:3px 1px;border-radius:4px;
     -webkit-box-decoration-break:clone;box-decoration-break:clone
   }
-  .s.past{opacity:0.18}
+  .s.past{opacity:0.15;color:var(--text-muted)}
   .s.cur{
-    opacity:1;font-weight:500;
-    background:rgba(34,197,94,0.12);
-    padding:2px 4px;
-    box-shadow:0 0 0 1px rgba(34,197,94,0.2);
-    color:#fff
+    opacity:1;font-weight:600;color:#fff;
+    background:rgba(34,197,94,0.22);
+    padding:3px 6px;
+    border-left:3px solid var(--green);
+    box-shadow:0 0 20px rgba(34,197,94,0.15)
   }
-  .s.up{opacity:0.45}
+  .s.up{opacity:0.40;color:var(--text-secondary)}
 
   .pause{
     display:flex;align-items:center;gap:10px;margin:1.4em 0;padding:14px 18px;
@@ -232,6 +232,12 @@
   <button class="btn-primary" id="btnStart">Start Session</button>
   <span class="hint">or press <kbd>Space</kbd></span>
   <div style="flex:1"></div>
+  <div class="audio-viz mic-test" id="micTest" title="Mic test — speak to see bars move">
+    <div class="bar"></div><div class="bar"></div><div class="bar"></div>
+    <div class="bar"></div><div class="bar"></div><div class="bar"></div>
+  </div>
+  <span id="micTestLabel" class="hint">Mic</span>
+  <div style="width:12px"></div>
   <button class="btn-ghost" id="btnClose" style="padding:8px 14px">Close</button>
 </div>
 
@@ -257,7 +263,7 @@
     </div>
     <div class="sep"></div>
     <button id="btnFontDown">A&#x2212;</button>
-    <span class="font-val" id="fontVal">26</span>
+    <span class="font-val" id="fontVal">34</span>
     <button id="btnFontUp">A+</button>
     <div class="sep"></div>
     <button id="btnHelp">?</button>
@@ -308,7 +314,7 @@ let items = [];          // flat array of {text, words, section, kind:'s'|'p'}
 let idx = 0;
 let state = 'idle';      // idle | loaded | run | pause | wait | done
 let speed = 150;
-let fontSize = 26;
+let fontSize = 34;
 let timer = null;
 let clockId = null;
 let t0 = null;
@@ -419,16 +425,56 @@ function loadScript(data){
   highlight();
   show('nav'); show('startBar'); show('tp');
   hide('empty'); hide('status'); hide('doneOverlay');
+
+  // Start mic test so user can see the bars respond before starting session
+  startMicTest();
+}
+
+// ── Mic test (pre-session) ──
+let micTestUnlisten = null;
+async function startMicTest(){
+  try{
+    // Use the same start_audio but we'll stop it when session starts
+    await invoke('start_audio', { sentences: [] });
+    const label = document.getElementById('micTestLabel');
+    if(label) label.textContent = 'Mic ready';
+
+    micTestUnlisten = await listen('vad', (event)=>{
+      const {speaking, level} = event.payload;
+      const viz = document.getElementById('micTest');
+      if(!viz) return;
+      const bars = viz.querySelectorAll('.bar');
+      bars.forEach((bar, i)=>{
+        const jitter = Math.sin(Date.now()/100 + i*1.5) * 0.3 + 0.7;
+        const h = speaking ? Math.max(2, Math.min(level,100) * jitter * 0.22) : 2;
+        bar.style.height = h + 'px';
+        bar.style.background = speaking ? 'var(--green)' : 'var(--text-muted)';
+      });
+      if(label) label.textContent = speaking ? 'Hearing you' : 'Mic ready';
+    });
+  }catch(e){
+    const label = document.getElementById('micTestLabel');
+    if(label) label.textContent = 'No mic';
+  }
+}
+function stopMicTest(){
+  if(micTestUnlisten){micTestUnlisten();micTestUnlisten=null}
+  invoke('stop_audio').catch(()=>{});
+  // Brief delay before session starts its own audio
 }
 
 // ── Session lifecycle ──
 async function startSession(){
   if(state!=='loaded')return;
+
+  // Stop mic test first, wait for audio to release
+  stopMicTest();
+  await new Promise(r=>setTimeout(r, 300));
+
   state='run'; t0=Date.now(); secTimes={0:Date.now()};
   hide('startBar'); show('status');
 
-  // Try to start audio capture for VAD-controlled scroll
-  // Send script sentences for Tier 2 alignment
+  // Start audio capture for VAD-controlled scroll
   const sentences = items.filter(it=>it.kind==='s').map(it=>it.text);
   try{
     await invoke('start_audio', { sentences });
@@ -832,8 +878,17 @@ function highlight(){
     else if(i===idx) el.classList.add('cur');
     else el.classList.add('up');
   });
+  // Pin current sentence to ~35% from top of viewport (not center —
+  // lets you see more upcoming text, like a real teleprompter)
   const cur=document.querySelector('.s.cur');
-  if(cur) cur.scrollIntoView({behavior:'smooth',block:'center'});
+  if(cur){
+    const tp=els.tp;
+    const tpRect=tp.getBoundingClientRect();
+    const curRect=cur.getBoundingClientRect();
+    const targetY=tpRect.top + tpRect.height * 0.35;
+    const offset=curRect.top - targetY;
+    tp.scrollBy({top:offset, behavior:'smooth'});
+  }
 
   document.querySelectorAll('.pause[data-i]').forEach(el=>{
     const i=+el.dataset.i;
