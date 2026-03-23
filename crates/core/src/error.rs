@@ -6,28 +6,8 @@ pub enum PrompterError {
     Parse(#[from] ParseError),
 
     #[cfg(feature = "audio")]
-    #[error(transparent)]
-    Audio(#[from] AudioError),
-}
-
-/// Errors from the audio capture subsystem.
-#[cfg(feature = "audio")]
-#[derive(Debug, Error)]
-pub enum AudioError {
-    #[error("no audio input device found")]
-    NoDevice,
-
-    #[error("microphone permission denied")]
-    PermissionDenied,
-
-    #[error("audio device disconnected")]
-    DeviceLost,
-
-    #[error("audio config error: {0}")]
-    Config(String),
-
-    #[error("audio stream error: {0}")]
-    Stream(String),
+    #[error("audio error: {0}")]
+    Audio(#[from] minutes_core::error::CaptureError),
 }
 
 #[derive(Debug, Error)]

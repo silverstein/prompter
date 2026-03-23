@@ -7,7 +7,7 @@ description = "Script parser, alignment engine, and compliance tracker for Promp
 
 [features]
 default = ["audio"]
-audio = ["dep:cpal", "dep:hound", "dep:crossbeam-channel"]
+audio = ["dep:minutes-core"]
 whisper = ["dep:whisper-rs", "audio"]
 
 [dependencies]
@@ -15,10 +15,10 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2"
 
-# Audio (optional — only needed for live teleprompter, not script parsing)
-cpal = { version = "0.15", optional = true }
-hound = { version = "3.5", optional = true }
-crossbeam-channel = { version = "0.5", optional = true }
+# Audio via minutes-core (shared streaming API)
+minutes-core = { path = "../../../minutes/crates/core", default-features = false, features = ["streaming"], optional = true }
+
+# Whisper (for Tier 2 tracking — uses minutes-core's cpal under the hood)
 whisper-rs = { version = "0.16", optional = true }
 
 [dev-dependencies]
