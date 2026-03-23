@@ -647,7 +647,7 @@ function endSession(){
     saved.style.cssText = 'font-size:12px;color:var(--text-muted);margin-top:12px';
     saved.textContent = 'Report saved to '+path;
     card.appendChild(saved);
-  }).catch(()=>{});
+  }).catch(e=>{showErr('Compliance report not saved: '+e)});
 
   // Fetch coaching insights
   invoke('get_coaching', { report: {
@@ -693,7 +693,7 @@ function endSession(){
     const doneBtn = card.querySelector('.btn-primary');
     if(doneBtn) card.insertBefore(coachDiv, doneBtn);
     else card.appendChild(coachDiv);
-  }).catch(()=>{});
+  }).catch(e=>{/* coaching is non-critical — log but don't alarm */console.warn('coaching:',e)});
 
   const btn=document.createElement('button');
   btn.className='btn-primary'; btn.textContent='Done';
@@ -711,7 +711,13 @@ function advance(){
 function retreat(){if(idx>0){idx--;highlight()}}
 function jumpSec(si){
   const i=items.findIndex(it=>it.section===si);
-  if(i>=0){idx=i;if(!secTimes[si])secTimes[si]=Date.now();highlight();$(('sec-'+si)).scrollIntoView({behavior:'smooth'})}
+  if(i>=0){
+    idx=i;
+    if(!secTimes[si]) secTimes[si]=Date.now();
+    highlight();
+    const el=$('sec-'+si);
+    if(el) el.scrollIntoView({behavior:'smooth'});
+  }
 }
 
 // ── Build nav ──
@@ -900,10 +906,15 @@ async function restoreSettings(){
   }catch(e){}
 }
 
-function persistSettings(){
-  invoke('save_settings', { settings: {
-    font_size: fontSize, speed, always_on_top: pinned, recent_scripts: []
-  }}).catch(()=>{});
+async function persistSettings(){
+  // Read-merge-write to avoid nuking recent_scripts
+  try{
+    const current = await invoke('load_settings');
+    current.font_size = fontSize;
+    current.speed = speed;
+    current.always_on_top = pinned;
+    await invoke('save_settings', { settings: current });
+  }catch(e){}
 }
 
 async function togglePin(){

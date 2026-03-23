@@ -71,7 +71,8 @@ impl Vad {
             self.hangover_remaining = self.hangover_chunks;
             self.silence_ms = 0;
         } else if self.hangover_remaining > 0 {
-            // In hangover period — still "speaking" but energy dropped
+            // In hangover period — keep "speaking" state active
+            self.is_speaking = true;
             self.hangover_remaining -= 1;
             self.silence_ms = 0;
         } else {

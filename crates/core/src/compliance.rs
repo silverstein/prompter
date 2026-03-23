@@ -47,11 +47,16 @@ impl ComplianceReport {
     pub fn write_to_dir(&self, dir: &Path) -> Result<PathBuf, std::io::Error> {
         std::fs::create_dir_all(dir)?;
 
-        // Generate filename from title + date
+        // Generate filename from title + date, with collision avoidance
         let date = chrono_lite_date();
         let slug = slugify(&self.script_title);
-        let filename = format!("{}-{}.md", date, slug);
-        let path = dir.join(&filename);
+        let base = format!("{}-{}", date, slug);
+        let mut path = dir.join(format!("{}.md", base));
+        let mut counter = 2u32;
+        while path.exists() {
+            path = dir.join(format!("{}-{}.md", base, counter));
+            counter += 1;
+        }
 
         let mut content = String::new();
 

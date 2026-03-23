@@ -151,12 +151,12 @@ struct AlignEvent {
 /// `sentences` is the flat list of script sentences for alignment matching.
 #[tauri::command]
 fn start_audio(app: tauri::AppHandle, sentences: Vec<String>) -> Result<String, String> {
-    if AUDIO_RUNNING.load(Ordering::Relaxed) {
+    // Atomic check-and-set to prevent race condition on double-start
+    if AUDIO_RUNNING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return Err("Audio already running".into());
     }
 
-    AUDIO_STOP.store(false, Ordering::Relaxed);
-    AUDIO_RUNNING.store(true, Ordering::Relaxed);
+    AUDIO_STOP.store(false, Ordering::SeqCst);
 
     let stop = Arc::clone(&AUDIO_STOP);
 
@@ -537,23 +537,28 @@ fn parse_deep_link(url: &str) -> Option<(String, String)> {
     None
 }
 
-/// Simple URL decoding (handles %20, %2F, etc.)
+/// URL decoding — collects percent-encoded bytes then decodes as UTF-8.
 fn urlencoding_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
+    let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '%' {
             let hex: String = chars.by_ref().take(2).collect();
             if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                result.push(byte as char);
+                bytes.push(byte);
             }
         } else if c == '+' {
-            result.push(' ');
+            bytes.push(b' ');
+        } else if c.is_ascii() {
+            bytes.push(c as u8);
         } else {
-            result.push(c);
+            // Non-ASCII char not percent-encoded — encode as UTF-8
+            let mut buf = [0u8; 4];
+            let encoded = c.encode_utf8(&mut buf);
+            bytes.extend_from_slice(encoded.as_bytes());
         }
     }
-    result
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn main() {
