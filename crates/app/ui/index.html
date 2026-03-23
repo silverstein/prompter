@@ -80,11 +80,19 @@
 
   .s{
     font-size:var(--font-size);line-height:var(--line-height);display:inline;
-    transition:opacity .3s ease;opacity:var(--text-upcoming);color:var(--text)
+    transition:all .3s ease;opacity:0.3;color:var(--text);
+    padding:2px 0;border-radius:3px;
+    -webkit-box-decoration-break:clone;box-decoration-break:clone
   }
-  .s.past{opacity:var(--text-dimmed)}
-  .s.cur{opacity:1;font-weight:500}
-  .s.up{opacity:var(--text-upcoming)}
+  .s.past{opacity:0.18}
+  .s.cur{
+    opacity:1;font-weight:500;
+    background:rgba(34,197,94,0.12);
+    padding:2px 4px;
+    box-shadow:0 0 0 1px rgba(34,197,94,0.2);
+    color:#fff
+  }
+  .s.up{opacity:0.45}
 
   .pause{
     display:flex;align-items:center;gap:10px;margin:1.4em 0;padding:14px 18px;
@@ -144,8 +152,10 @@
   .dot.stop{background:var(--text-muted)}
   .dot.fin{background:var(--green)}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-  .mic-level{width:3px;height:18px;background:var(--border);border-radius:2px;overflow:hidden}
-  .mic-fill{width:100%;background:var(--green);border-radius:2px;transition:height 80ms ease;position:relative;bottom:0}
+  .mic-level{width:4px;height:22px;background:var(--border);border-radius:2px;overflow:hidden;display:flex;flex-direction:column-reverse}
+  .mic-fill{width:100%;background:var(--green);border-radius:2px;transition:height 80ms ease}
+  .audio-viz{display:flex;align-items:flex-end;gap:1px;height:22px}
+  .audio-viz .bar{width:3px;background:var(--green);border-radius:1px;transition:height 80ms ease;min-height:2px}
   .progress-bar{width:120px;height:3px;background:var(--border);border-radius:2px;overflow:hidden}
   .progress-fill{height:100%;background:var(--green);border-radius:2px;transition:width .5s ease}
   .status-r{display:flex;align-items:center;gap:6px}
@@ -228,7 +238,11 @@
 <div class="status" id="status">
   <div class="status-l">
     <div class="dot" id="dot"></div>
-    <div class="mic-level" title="Mic level"><div class="mic-fill" id="micFill"></div></div>
+    <div class="audio-viz" id="audioViz" title="Mic level">
+      <div class="bar"></div><div class="bar"></div><div class="bar"></div>
+      <div class="bar"></div><div class="bar"></div><div class="bar"></div>
+      <div class="bar"></div><div class="bar"></div>
+    </div>
     <span id="stLabel">Ready</span>
     <div class="sep"></div>
     <div class="progress-bar"><div class="progress-fill" id="progFill" style="width:0%"></div></div>
@@ -305,7 +319,7 @@ let branchDecisions = {};  // "question text" -> "selected label"
 const $=id=>document.getElementById(id);
 const els = {};
 function initRefs(){
-  ['err','nav','empty','tp','startBar','status','dot','micFill','stLabel',
+  ['err','nav','empty','tp','startBar','status','dot','audioViz','stLabel',
    'progFill','stWords','stTime','speedVal','speedSlider','fontVal',
    'doneOverlay','doneCard','helpOverlay','helpCard','recentsContainer','pinBtn',
    'btnOpen','btnPaste','btnStart','btnClose','btnFontDown','btnFontUp','btnHelp'
@@ -471,9 +485,19 @@ function setupVadListener(){
     const {speaking, silence_ms, level} = event.payload;
     vadSpeaking = speaking;
 
-    // Update mic level indicator
-    const fill = els.micFill;
-    if(fill) fill.style.height = Math.min(level, 100)+'%';
+    // Update audio visualizer bars
+    const viz = els.audioViz;
+    if(viz){
+      const bars = viz.querySelectorAll('.bar');
+      const l = Math.min(level, 100);
+      bars.forEach((bar, i) => {
+        // Each bar gets a slightly different height for a natural waveform look
+        const jitter = Math.sin(Date.now()/100 + i*1.5) * 0.3 + 0.7;
+        const h = speaking ? Math.max(2, l * jitter * 0.22) : 2;
+        bar.style.height = h + 'px';
+        bar.style.background = speaking ? 'var(--green)' : 'var(--text-muted)';
+      });
+    }
 
     if(state!=='run' && state!=='wait') return;
 
@@ -516,13 +540,11 @@ function setupAlignListener(){
   listen('align', (event)=>{
     const {position, confidence, ad_libbing} = event.payload;
 
-    // Update confidence indicator in mic level bar
-    const fill = els.micFill;
-    if(fill){
-      if(ad_libbing) fill.style.background='var(--amber)';
-      else if(confidence > 0.5) fill.style.background='var(--green)';
-      else if(confidence > 0.3) fill.style.background='var(--amber)';
-      else fill.style.background='var(--red)';
+    // Update visualizer bar color based on alignment confidence
+    const viz = els.audioViz;
+    if(viz){
+      const color = ad_libbing ? 'var(--amber)' : confidence > 0.5 ? 'var(--green)' : confidence > 0.3 ? 'var(--amber)' : 'var(--red)';
+      viz.querySelectorAll('.bar').forEach(b => b.style.background = color);
     }
 
     if(state!=='run' && state!=='wait') return;
@@ -846,7 +868,7 @@ function updateSt(){
   const d=els.dot, l=els.stLabel;
   d.className='dot';
   switch(state){
-    case 'run': d.classList.add('go'); l.textContent=audioMode?(vadSpeaking?'Speaking\u2026':'Listening\u2026'):'Auto-scrolling\u2026'; break;
+    case 'run': d.classList.add('go'); l.textContent=audioMode?(vadSpeaking?'Tracking your voice':'Listening\u2026'):'Auto-scrolling\u2026'; break;
     case 'pause': d.classList.add('stop'); l.textContent='Paused'; break;
     case 'wait': d.classList.add('wait'); l.textContent='Waiting for response\u2026'; break;
     case 'done': d.classList.add('fin'); l.textContent='Complete'; break;

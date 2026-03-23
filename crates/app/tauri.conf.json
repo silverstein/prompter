@@ -24,7 +24,8 @@
         "resizable": true,
         "decorations": true,
         "titleBarStyle": "Overlay",
-        "hiddenTitle": true
+        "hiddenTitle": true,
+        "contentProtected": true
       }
     ],
     "security": {
