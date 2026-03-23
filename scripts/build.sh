@@ -15,8 +15,12 @@ echo "  App: target/release/bundle/macos/Prompter.app"
 
 if [ "$1" = "--install" ]; then
     echo "=== Installing to /Applications ==="
-    pkill -f "Prompter" 2>/dev/null || true
-    sleep 1
-    cp -Rf target/release/bundle/macos/Prompter.app /Applications/Prompter.app
+    pkill -9 -f "prompter-app" 2>/dev/null || true
+    pkill -9 -f "Prompter" 2>/dev/null || true
+    sleep 2
+    # Must rm first — cp -Rf doesn't overwrite cached macOS app bundles
+    rm -rf /Applications/Prompter.app
+    cp -R target/release/bundle/macos/Prompter.app /Applications/Prompter.app
     echo "  Installed to /Applications/Prompter.app"
+    echo "  Binary: $(stat -f '%Sm' /Applications/Prompter.app/Contents/MacOS/prompter-app)"
 fi
