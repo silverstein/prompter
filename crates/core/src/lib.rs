@@ -1,4 +1,5 @@
 pub mod align;
+pub mod checklist;
 pub mod coaching;
 pub mod compliance;
 pub mod error;
@@ -20,6 +21,10 @@ pub mod transcribe;
 pub use transcribe::StreamingTranscriber;
 
 pub use align::{similarity, AlignResult, AlignmentEngine, MATCH_THRESHOLD};
+pub use checklist::{
+    cmr_checklist, obra_counseling_checklist, ChecklistEvaluator, ChecklistItem, ChecklistResult,
+    ChecklistStatus, KeywordChecklistEvaluator, LlmChecklistEvaluator, LlmClient,
+};
 pub use compliance::ComplianceReport;
 pub use error::{ParseError, PrompterError};
 pub use script::{BranchOption, Directive, Frontmatter, Script, Section, Sentence};
