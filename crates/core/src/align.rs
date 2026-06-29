@@ -48,8 +48,8 @@ impl AlignmentEngine {
         Self {
             sentences,
             cursor: 0,
-            window_radius: 15,  // Search ±15 sentences (~30 sentence window)
-            threshold: 0.35,    // 35% bigram overlap required
+            window_radius: 15, // Search ±15 sentences (~30 sentence window)
+            threshold: 0.35,   // 35% bigram overlap required
             miss_count: 0,
         }
     }
@@ -65,29 +65,21 @@ impl AlignmentEngine {
         self.miss_count = 0;
     }
 
-    /// Attempt to align recognized text against the script.
-    /// Returns the alignment result with the best matching position.
-    pub fn align(&mut self, recognized: &str) -> AlignResult {
+    /// Search the window around the cursor for the best fuzzy match.
+    ///
+    /// Pure / non-mutating. Returns `(best_pos, best_score)`, or `None` when the
+    /// input is too short or has no usable bigrams to match. Shared by `align`
+    /// (which commits) and `peek` (which does not).
+    fn search(&self, recognized: &str) -> Option<(usize, f32)> {
         let recognized = normalize(recognized);
-
         if recognized.len() < 10 {
-            // Too short to match reliably
-            return AlignResult {
-                matched: false,
-                position: self.cursor,
-                confidence: 0.0,
-                ad_libbing: self.miss_count > 5,
-            };
+            // Too short to match reliably.
+            return None;
         }
 
         let rec_bigrams = bigrams(&recognized);
         if rec_bigrams.is_empty() {
-            return AlignResult {
-                matched: false,
-                position: self.cursor,
-                confidence: 0.0,
-                ad_libbing: self.miss_count > 5,
-            };
+            return None;
         }
 
         let n = self.sentences.len();
@@ -97,7 +89,7 @@ impl AlignmentEngine {
         let mut best_score: f32 = 0.0;
         let mut best_pos = self.cursor;
 
-        // Try matching against individual sentences and 2-3 sentence windows
+        // Try matching against individual sentences and 2-3 sentence windows.
         for i in start..end {
             // Single sentence
             let score = bigram_similarity(&rec_bigrams, &self.sentences[i]);
@@ -132,9 +124,27 @@ impl AlignmentEngine {
             }
         }
 
+        Some((best_pos, best_score))
+    }
+
+    /// Attempt to align recognized text against the script and COMMIT the
+    /// result: on a confident match the cursor advances (forward, or a small
+    /// back-jump for re-reading) and miss-state resets; on a miss the miss
+    /// counter increments (feeding ad-lib detection). Use this for stabilized /
+    /// final hypotheses.
+    pub fn align(&mut self, recognized: &str) -> AlignResult {
+        let Some((best_pos, best_score)) = self.search(recognized) else {
+            return AlignResult {
+                matched: false,
+                position: self.cursor,
+                confidence: 0.0,
+                ad_libbing: self.miss_count > 5,
+            };
+        };
+
         if best_score >= self.threshold {
-            // Good match — update cursor
-            // Only advance forward or allow small backward jumps (re-reading)
+            // Good match — update cursor.
+            // Only advance forward or allow small backward jumps (re-reading).
             if best_pos >= self.cursor || self.cursor - best_pos <= 3 {
                 self.cursor = best_pos;
             }
@@ -153,6 +163,34 @@ impl AlignmentEngine {
                 confidence: best_score,
                 ad_libbing: self.miss_count > 5,
             }
+        }
+    }
+
+    /// Non-mutating alignment: compute the best match WITHOUT moving the cursor
+    /// or touching miss-state. Use this for partial / volatile hypotheses so a
+    /// revised-before-final recognition ("flicker") cannot commit a wrong jump.
+    /// On a confident match `position` is the matched index; otherwise it stays
+    /// at the current cursor.
+    pub fn peek(&self, recognized: &str) -> AlignResult {
+        match self.search(recognized) {
+            Some((best_pos, best_score)) if best_score >= self.threshold => AlignResult {
+                matched: true,
+                position: best_pos,
+                confidence: best_score,
+                ad_libbing: false,
+            },
+            Some((_, best_score)) => AlignResult {
+                matched: false,
+                position: self.cursor,
+                confidence: best_score,
+                ad_libbing: self.miss_count > 5,
+            },
+            None => AlignResult {
+                matched: false,
+                position: self.cursor,
+                confidence: 0.0,
+                ad_libbing: self.miss_count > 5,
+            },
         }
     }
 }
@@ -260,11 +298,39 @@ mod tests {
     }
 
     #[test]
+    fn peek_does_not_move_cursor() {
+        let mut eng = make_engine();
+        eng.align("hi thanks for meeting with me today");
+        assert_eq!(eng.position(), 0);
+        // Peeking a later sentence reports the match but must not advance.
+        let r = eng.peek("you are currently taking warfarin and metformin");
+        assert!(r.matched);
+        assert_eq!(r.position, 6);
+        assert_eq!(eng.position(), 0, "peek must not move the committed cursor");
+    }
+
+    #[test]
+    fn peek_then_align_commits() {
+        let mut eng = make_engine();
+        let p = eng.peek("you are currently taking warfarin and metformin");
+        assert!(p.matched);
+        assert_eq!(eng.position(), 0, "peek leaves the cursor put");
+        let a = eng.align("you are currently taking warfarin and metformin");
+        assert!(a.matched);
+        assert_eq!(eng.position(), 6, "align commits the move");
+    }
+
+    #[test]
     fn no_match_for_adlib() {
         let mut eng = make_engine();
         // Use text with zero overlap with pharmacy script vocabulary
-        let r = eng.align("jupyter notebook crashed during pytorch backpropagation gradient descent");
-        assert!(!r.matched, "unrelated tech text should not match pharmacy script, confidence: {}", r.confidence);
+        let r =
+            eng.align("jupyter notebook crashed during pytorch backpropagation gradient descent");
+        assert!(
+            !r.matched,
+            "unrelated tech text should not match pharmacy script, confidence: {}",
+            r.confidence
+        );
     }
 
     #[test]
@@ -295,20 +361,31 @@ mod tests {
     #[test]
     fn normalize_strips_punctuation() {
         assert_eq!(normalize("Hello, World!"), "hello world");
-        assert_eq!(normalize("You're taking Warfarin."), "you re taking warfarin");
+        assert_eq!(
+            normalize("You're taking Warfarin."),
+            "you re taking warfarin"
+        );
     }
 
     #[test]
     fn bigram_similarity_identical() {
         let bg = bigrams("hello world");
         let score = bigram_similarity(&bg, "hello world");
-        assert!((score - 1.0).abs() < 0.01, "identical text should score ~1.0, got {}", score);
+        assert!(
+            (score - 1.0).abs() < 0.01,
+            "identical text should score ~1.0, got {}",
+            score
+        );
     }
 
     #[test]
     fn bigram_similarity_different() {
         let bg = bigrams("hello world");
         let score = bigram_similarity(&bg, "goodbye universe");
-        assert!(score < 0.3, "different text should score low, got {}", score);
+        assert!(
+            score < 0.3,
+            "different text should score low, got {}",
+            score
+        );
     }
 }
