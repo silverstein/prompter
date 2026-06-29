@@ -18,7 +18,7 @@ pub mod transcribe;
 #[cfg(feature = "whisper")]
 pub use transcribe::StreamingTranscriber;
 
-pub use align::{AlignResult, AlignmentEngine};
+pub use align::{similarity, AlignResult, AlignmentEngine, MATCH_THRESHOLD};
 pub use compliance::ComplianceReport;
 pub use error::{ParseError, PrompterError};
 pub use script::{BranchOption, Directive, Frontmatter, Script, Section, Sentence};

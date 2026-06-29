@@ -247,6 +247,21 @@ fn bigram_similarity(rec_bigrams: &[[u8; 2]], reference: &str) -> f32 {
     2.0 * matches as f32 / (rec_bigrams.len() + ref_bigrams.len()) as f32
 }
 
+/// Minimum bigram-Dice similarity for a confident match (the engine's internal
+/// alignment threshold). Exposed so callers that score outside an
+/// [`AlignmentEngine`] (e.g. choosing among branch options) use the same bar.
+pub const MATCH_THRESHOLD: f32 = 0.35;
+
+/// Bigram-Dice similarity (0.0-1.0) between recognized text and a reference
+/// string, applying the same normalization the engine uses. A standalone scorer
+/// for one-off comparisons (branch-option selection, return-to-main detection)
+/// that do not warrant a full windowed [`AlignmentEngine`] pass.
+pub fn similarity(recognized: &str, reference: &str) -> f32 {
+    let normalized = normalize(recognized);
+    let rec_bigrams = bigrams(&normalized);
+    bigram_similarity(&rec_bigrams, reference)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +401,28 @@ mod tests {
             score < 0.3,
             "different text should score low, got {}",
             score
+        );
+    }
+
+    #[test]
+    fn similarity_helper_matches_and_separates() {
+        // A near-exact read clears the threshold; the other option does not, and
+        // the matching option scores strictly higher (margin for selection).
+        let yes = similarity(
+            "great lets discuss your concerns",
+            "great lets discuss your concerns in detail",
+        );
+        let no = similarity(
+            "great lets discuss your concerns",
+            "okay then lets keep moving along",
+        );
+        assert!(
+            yes >= MATCH_THRESHOLD,
+            "matching option should clear bar: {yes}"
+        );
+        assert!(
+            yes > no,
+            "matching option must beat the other: {yes} vs {no}"
         );
     }
 }
