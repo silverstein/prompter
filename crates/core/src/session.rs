@@ -118,7 +118,14 @@ impl SessionRecorder {
         // sentence delivered -- that was the over-count the cursor-based path had.
         if update.matched {
             match &update.state {
-                TrackState::Speaking | TrackState::AtBranch { .. } => {
+                // InBranch carries the pre-branch sentence index: reaching a
+                // branch means that sentence was read, so it counts as covered
+                // (this also fixes the same-final reach-branch-and-select case
+                // where only one InBranch update is emitted). A branch option's
+                // own words are intentionally not part of main-line adherence.
+                TrackState::Speaking
+                | TrackState::AtBranch { .. }
+                | TrackState::InBranch { .. } => {
                     if update.sentence_index < self.covered.len() {
                         self.covered[update.sentence_index] = true;
                     }
@@ -129,8 +136,7 @@ impl SessionRecorder {
                         self.pauses_reached.insert(update.sentence_index);
                     }
                 }
-                // In-branch / ad-lib updates do not mark a main sentence covered.
-                TrackState::InBranch { .. } | TrackState::AdLibbing => {}
+                TrackState::AdLibbing => {}
             }
         }
 
