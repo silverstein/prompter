@@ -25,4 +25,4 @@ pub use error::{ParseError, PrompterError};
 pub use script::{BranchOption, Directive, Frontmatter, Script, Section, Sentence};
 pub use session::{SessionRecorder, TranscriptLine};
 pub use speech::{MockSpeechProvider, RecognizedWord, SpeechProvider, SpeechUpdate};
-pub use tracker::{ScriptTracker, TimelineStep, TrackState, TrackUpdate};
+pub use tracker::{BranchChoice, ScriptTracker, TimelineStep, TrackState, TrackUpdate};

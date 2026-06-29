@@ -6,20 +6,25 @@
 //! substring matcher that lived in the UI: alignment is decided in Rust, in one
 //! tested place, and the app only renders the resulting position + state.
 //!
-//! Two rules drive it (see `docs/UPGRADE-2026.md`, D5):
+//! Rules that drive it (see `docs/UPGRADE-2026.md`, D5):
 //!
 //! 1. **De-flicker.** Partial/volatile hypotheses move only a forward,
 //!    non-committing *preview* cursor (via [`AlignmentEngine::peek`]); finals
 //!    commit (via [`AlignmentEngine::align`]). The preview is monotonic between
-//!    commits and never reported state-downgrades a committed pause/branch.
+//!    commits and a partial never state-downgrades a committed pause/branch.
 //!
-//! 2. **Branches are a tree, not a line.** Only the main-line sentences go into
-//!    the windowed aligner. Branch options are mutually exclusive, so mixing
-//!    them into one forward-searched list is wrong (a future option can win a
-//!    match, cross-option windows are impossible text, and return-to-main can
-//!    fall outside the window). Instead a small state machine -- Linear ->
-//!    AwaitingBranch -> InBranch -> Linear -- scores each branch's options in
-//!    isolation and detects the return to the main line.
+//! 2. **Evidence.** Every [`TrackUpdate`] carries `matched`: whether this update
+//!    is real alignment evidence (a confident match / a branch selection / a
+//!    branch return). A final that does not confidently match still reports a
+//!    committed update (so the UI stays put) but with `matched == false`, so
+//!    downstream consumers (the session recorder) do not count it as delivered.
+//!
+//! 3. **Branches are a tree, not a line.** Only the main-line sentences go into
+//!    the windowed aligner. Branch options are mutually exclusive, so a small
+//!    state machine -- Linear -> AwaitingBranch -> InBranch -> Linear -- scores
+//!    each branch's options in isolation and detects the return to the main
+//!    line. A branch selection carries its [`BranchChoice`] (question + label)
+//!    so attribution needs no external state.
 
 use crate::align::{self, AlignmentEngine};
 use crate::script::{Directive, Element, Script};
@@ -27,19 +32,16 @@ use crate::speech::SpeechUpdate;
 use std::collections::HashMap;
 
 /// Minimum margin by which the best branch option must beat the runner-up to be
-/// selected (on top of clearing [`align::MATCH_THRESHOLD`]). Avoids committing to
-/// a path when two options score nearly the same.
+/// selected (on top of clearing [`align::MATCH_THRESHOLD`]).
 const BRANCH_MARGIN: f32 = 0.10;
 
 /// One step in the flattened script timeline. Indices into the slice returned by
-/// [`ScriptTracker::timeline`] are stable for the life of the tracker, so the UI
-/// can map a step to a rendered element.
+/// [`ScriptTracker::timeline`] are stable for the life of the tracker.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TimelineStep {
     /// A section heading boundary.
     Section { name: String },
-    /// A spoken sentence on the main line. `sentence_index` is its index in the
-    /// flat main-line sentence list handed to the aligner.
+    /// A main-line sentence. `sentence_index` is its index in the aligner list.
     Sentence { text: String, sentence_index: usize },
     /// A pause point: the teleprompter waits for the other party.
     Pause { prompt: String },
@@ -48,8 +50,7 @@ pub enum TimelineStep {
         question: String,
         options: Vec<String>,
     },
-    /// A sentence that belongs to one branch option (rendered, but not part of
-    /// the main-line aligner).
+    /// A sentence belonging to one branch option (rendered, not in the aligner).
     BranchSentence { option_label: String, text: String },
 }
 
@@ -71,6 +72,14 @@ pub enum TrackState {
     AdLibbing,
 }
 
+/// A selected branch path, carried on the selecting update so attribution needs
+/// no external state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchChoice {
+    pub question: String,
+    pub option_label: String,
+}
+
 /// The result of observing one [`SpeechUpdate`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackUpdate {
@@ -80,65 +89,54 @@ pub struct TrackUpdate {
     /// Timeline index to highlight (a main sentence, or the selected branch
     /// option's first sentence while in a branch).
     pub timeline_index: usize,
-    /// True when this came from a committed (final) match; false for a preview.
+    /// True when this came from a final (vs a partial preview).
     pub committed: bool,
+    /// True when this update is real alignment evidence (confident match,
+    /// branch selection, or branch return). Unmatched finals are `false`.
+    pub matched: bool,
     /// Match confidence (0.0-1.0).
     pub confidence: f32,
     /// Current state (pause/branch only escalate on committed updates).
     pub state: TrackState,
-    /// Set once, on the committed update that selects a branch option.
-    pub selected_branch_option: Option<String>,
+    /// Set on the committed update that selects a branch option.
+    pub branch_choice: Option<BranchChoice>,
 }
 
-/// A branch's options and where to resume on the main line afterwards.
 struct BranchData {
     question: String,
     option_labels: Vec<String>,
     options: Vec<BranchOptionData>,
-    /// First main-line sentence index after the branch (where the speaker
-    /// returns once the chosen option is done). `None` if the branch is last.
+    /// First main-line sentence after the branch (return point). `None` if last.
     post_main: Option<usize>,
 }
 
 struct BranchOptionData {
     label: String,
-    /// The option's sentences joined for scoring.
     joined: String,
-    /// Timeline index of the option's first sentence (for highlighting).
     first_timeline: Option<usize>,
 }
 
 /// The tracker's position in the branch tree.
 #[derive(Debug, Clone, PartialEq)]
 enum Mode {
-    /// Following the main line.
     Linear,
-    /// Reached a branch; scoring options to decide the path.
     AwaitingBranch { branch: usize },
-    /// Inside a selected option; watching for the return to the main line.
     InBranch { branch: usize, option: usize },
 }
 
 /// Tracks the speaker's position in a script from a stream of speech updates.
 pub struct ScriptTracker {
     timeline: Vec<TimelineStep>,
-    /// Main-line sentence text, in order (the only aligner units).
     main_sentences: Vec<String>,
-    /// Maps a main sentence index to its index in `timeline`.
     main_to_timeline: Vec<usize>,
-    /// Branch metadata, indexed by branch id.
     branches: Vec<BranchData>,
-    /// Maps a main sentence index to the branch that immediately follows it.
+    /// Main sentence index -> branch that immediately follows it.
     branch_after: HashMap<usize, usize>,
     engine: AlignmentEngine,
     mode: Mode,
-    /// Committed main-line sentence index.
     committed: usize,
-    /// Forward preview index from partials (>= committed, monotonic until commit).
     preview: usize,
-    /// Timeline index of the current committed highlight.
     committed_timeline: usize,
-    /// Last committed state (carried on partials so they do not downgrade it).
     committed_state: TrackState,
 }
 
@@ -150,7 +148,6 @@ impl ScriptTracker {
         let mut main_to_timeline = Vec::new();
         let mut branches: Vec<BranchData> = Vec::new();
         let mut branch_after = HashMap::new();
-        // Branch ids still waiting for their post-branch main sentence.
         let mut pending_post: Vec<usize> = Vec::new();
         let mut last_main: Option<usize> = None;
 
@@ -163,7 +160,6 @@ impl ScriptTracker {
                     Element::Text(sentences) => {
                         for sentence in sentences {
                             let main_index = main_sentences.len();
-                            // Resolve any branches waiting for a return point.
                             for branch in pending_post.drain(..) {
                                 branches[branch].post_main = Some(main_index);
                             }
@@ -262,8 +258,7 @@ impl ScriptTracker {
         self.preview
     }
 
-    /// Manually move the cursor (e.g. the operator scrolls/clicks). Re-derives
-    /// linear/awaiting-branch mode + state at the chosen main sentence.
+    /// Manually move the cursor; re-derives linear/awaiting-branch mode + state.
     pub fn set_position(&mut self, sentence_index: usize) {
         self.engine.set_position(sentence_index);
         self.commit_linear();
@@ -282,14 +277,14 @@ impl ScriptTracker {
     /// Observe one recognition update and return the resulting position/state.
     pub fn observe(&mut self, update: &SpeechUpdate) -> TrackUpdate {
         if self.main_sentences.is_empty() {
-            // Nothing alignable: surface a neutral, non-escalating update.
             return TrackUpdate {
                 sentence_index: 0,
                 timeline_index: 0,
                 committed: update.is_final,
+                matched: false,
                 confidence: 0.0,
                 state: TrackState::Speaking,
-                selected_branch_option: None,
+                branch_choice: None,
             };
         }
         if update.is_final {
@@ -300,43 +295,33 @@ impl ScriptTracker {
     }
 
     fn observe_final(&mut self, text: &str) -> TrackUpdate {
-        // Inside a branch: only watch for the return to the main line.
+        // Inside a branch: watch for the return to the main line.
         if let Mode::InBranch { branch, option } = self.mode {
             if let Some(pm) = self.branches[branch].post_main {
                 if align::similarity(text, &self.main_sentences[pm]) >= align::MATCH_THRESHOLD {
                     self.engine.set_position(pm);
                     self.commit_linear();
-                    return self.committed_update(None);
+                    return self.committed_update(true, None);
                 }
             }
-            // Still reading the option: keep the highlight on it.
-            let label = self.branches[branch].options[option].label.clone();
-            let ti = self.branches[branch].options[option]
-                .first_timeline
-                .unwrap_or(self.committed_timeline);
+            // Still on the option: it is evidence only if it matches the option.
+            let opt = &self.branches[branch].options[option];
+            let matched = align::similarity(text, &opt.joined) >= align::MATCH_THRESHOLD;
+            let label = opt.label.clone();
+            let ti = opt.first_timeline.unwrap_or(self.committed_timeline);
             self.committed_timeline = ti;
             self.committed_state = TrackState::InBranch {
                 option_label: label,
             };
-            return self.committed_update(None);
+            return self.committed_update(matched, None);
         }
 
         // Awaiting a branch decision: try to pick an option.
         if let Mode::AwaitingBranch { branch } = self.mode {
-            if let Some(option) = self.choose_option(branch, text) {
-                let label = self.branches[branch].options[option].label.clone();
-                let ti = self.branches[branch].options[option]
-                    .first_timeline
-                    .unwrap_or(self.committed_timeline);
-                self.mode = Mode::InBranch { branch, option };
-                self.committed_timeline = ti;
-                self.committed_state = TrackState::InBranch {
-                    option_label: label.clone(),
-                };
-                return self.committed_update(Some(label));
+            if let Some(selected) = self.try_select(branch, text) {
+                return selected;
             }
-            // No option chosen -> fall through to main alignment (speaker may be
-            // re-reading the pre-branch line or skipping the branch entirely).
+            // No option chosen -> fall through to main alignment.
         }
 
         // Normal main-line alignment.
@@ -345,29 +330,35 @@ impl ScriptTracker {
         self.preview = self.committed;
         if result.ad_libbing {
             self.committed_state = TrackState::AdLibbing;
-            // Mode is unchanged: a sustained miss does not exit an awaited branch.
-        } else {
-            self.commit_linear();
+            return self.committed_update(false, None);
         }
-        self.committed_update(None)
+        self.commit_linear();
+        // Same-update selection: if this utterance both reached a branch and
+        // already names an option, select it now rather than waiting for the
+        // next final.
+        if let Mode::AwaitingBranch { branch } = self.mode {
+            if let Some(selected) = self.try_select(branch, text) {
+                return selected;
+            }
+        }
+        self.committed_update(result.matched, None)
     }
 
     fn observe_partial(&mut self, text: &str) -> TrackUpdate {
-        // While in a branch there is no main-line preview; hold the highlight.
         if matches!(self.mode, Mode::InBranch { .. }) {
             return TrackUpdate {
                 sentence_index: self.committed,
                 timeline_index: self.committed_timeline,
                 committed: false,
+                matched: false,
                 confidence: 0.0,
                 state: self.committed_state.clone(),
-                selected_branch_option: None,
+                branch_choice: None,
             };
         }
         let result = self.engine.peek(text);
         if result.matched && result.position > self.preview {
-            // Monotonic forward preview between commits.
-            self.preview = result.position;
+            self.preview = result.position; // monotonic forward between commits
         }
         let timeline_index = self
             .main_to_timeline
@@ -378,15 +369,35 @@ impl ScriptTracker {
             sentence_index: self.preview,
             timeline_index,
             committed: false,
+            matched: false,
             confidence: result.confidence,
-            // Carry committed state: a partial must not clear AtPause/AtBranch.
             state: self.committed_state.clone(),
-            selected_branch_option: None,
+            branch_choice: None,
         }
     }
 
-    /// Update committed bookkeeping for a plain main-line position and set mode +
-    /// state from the lookahead at that position.
+    /// Try to select an option of `branch` from `text`; on success transition to
+    /// `InBranch` and return the selecting update.
+    fn try_select(&mut self, branch: usize, text: &str) -> Option<TrackUpdate> {
+        let option = self.choose_option(branch, text)?;
+        let opt = &self.branches[branch].options[option];
+        let label = opt.label.clone();
+        let ti = opt.first_timeline.unwrap_or(self.committed_timeline);
+        let question = self.branches[branch].question.clone();
+        self.mode = Mode::InBranch { branch, option };
+        self.committed_timeline = ti;
+        self.committed_state = TrackState::InBranch {
+            option_label: label.clone(),
+        };
+        Some(self.committed_update(
+            true,
+            Some(BranchChoice {
+                question,
+                option_label: label,
+            }),
+        ))
+    }
+
     fn commit_linear(&mut self) {
         self.committed = self.engine.position();
         self.preview = self.committed;
@@ -402,9 +413,6 @@ impl ScriptTracker {
         };
     }
 
-    /// Choose the best-scoring branch option for `text`, if one clears the
-    /// threshold and beats the runner-up by [`BRANCH_MARGIN`]. Empty options
-    /// (no sentences) cannot be chosen.
     fn choose_option(&self, branch: usize, text: &str) -> Option<usize> {
         let mut scored: Vec<(usize, f32)> = self.branches[branch]
             .options
@@ -426,9 +434,6 @@ impl ScriptTracker {
         }
     }
 
-    /// State at a committed main sentence: a following branch, then a following
-    /// pause, else speaking. (A branch is prioritized over a pause when both
-    /// somehow follow the same sentence.)
     fn linear_state_at(&self, sentence_index: usize) -> TrackState {
         if let Some(&branch) = self.branch_after.get(&sentence_index) {
             return TrackState::AtBranch {
@@ -447,14 +452,15 @@ impl ScriptTracker {
         }
     }
 
-    fn committed_update(&self, selected_branch_option: Option<String>) -> TrackUpdate {
+    fn committed_update(&self, matched: bool, branch_choice: Option<BranchChoice>) -> TrackUpdate {
         TrackUpdate {
             sentence_index: self.committed,
             timeline_index: self.committed_timeline,
             committed: true,
-            confidence: 1.0,
+            matched,
+            confidence: if matched { 1.0 } else { 0.0 },
             state: self.committed_state.clone(),
-            selected_branch_option,
+            branch_choice,
         }
     }
 }
@@ -485,7 +491,6 @@ mod tests {
         }
     }
 
-    /// 2 sentences, pause, 1 sentence, branch (2 options x 1 sentence), closing.
     fn sample_script() -> Script {
         script_from(vec![Section {
             name: "Intro".into(),
@@ -522,8 +527,6 @@ mod tests {
     #[test]
     fn timeline_flattening_counts() {
         let t = ScriptTracker::new(&sample_script());
-        // Section, 2 sentences, Pause, 1 sentence, Branch, 2 branch sentences,
-        // closing = 9 steps. Only 4 main sentences are alignable.
         assert_eq!(t.timeline().len(), 9);
         assert_eq!(t.sentence_count(), 4);
         assert!(matches!(t.timeline()[3], TimelineStep::Pause { .. }));
@@ -535,36 +538,35 @@ mod tests {
     }
 
     #[test]
-    fn final_commits_and_advances() {
+    fn matched_final_commits_and_advances() {
         let mut t = ScriptTracker::new(&sample_script());
         let u = t.observe(&SpeechUpdate::finalized(
             "you are currently taking warfarin and metformin",
         ));
-        assert!(u.committed);
+        assert!(u.committed && u.matched);
         assert_eq!(u.sentence_index, 2);
-        assert_eq!(t.position(), 2);
     }
 
     #[test]
-    fn partial_previews_without_committing() {
+    fn unmatched_final_is_committed_but_not_matched() {
         let mut t = ScriptTracker::new(&sample_script());
-        let u = t.observe(&SpeechUpdate::partial(
-            "you are currently taking warfarin and metformin",
+        // Off-script text that does not align: committed update, but matched=false
+        // and the cursor does not move.
+        let u = t.observe(&SpeechUpdate::finalized(
+            "kubernetes pod autoscaling webpack bundle configuration",
         ));
-        assert!(!u.committed);
-        assert_eq!(u.sentence_index, 2, "preview jumps forward");
-        assert_eq!(t.position(), 0, "committed cursor unmoved on a partial");
+        assert!(u.committed);
+        assert!(!u.matched, "off-script speech is not evidence");
+        assert_eq!(t.position(), 0);
     }
 
     #[test]
     fn preview_is_monotonic_between_commits() {
         let mut t = ScriptTracker::new(&sample_script());
-        // Preview forward to sentence 2...
         t.observe(&SpeechUpdate::partial(
             "you are currently taking warfarin and metformin",
         ));
         assert_eq!(t.preview_position(), 2);
-        // ...a later, earlier-matching partial must not pull the preview back.
         t.observe(&SpeechUpdate::partial(
             "hi thanks for meeting with me today",
         ));
@@ -572,89 +574,72 @@ mod tests {
     }
 
     #[test]
-    fn reaching_sentence_before_pause_reports_pause() {
+    fn reaching_pause_and_branch() {
         let mut t = ScriptTracker::new(&sample_script());
-        let u = t.observe(&SpeechUpdate::finalized(
+        let p = t.observe(&SpeechUpdate::finalized(
             "my goal is simple to make sure every medication youre taking is safe",
         ));
-        assert!(matches!(u.state, TrackState::AtPause { .. }));
-    }
-
-    #[test]
-    fn reaching_branch_reports_at_branch() {
-        let mut t = ScriptTracker::new(&sample_script());
-        let u = t.observe(&SpeechUpdate::finalized(
+        assert!(matches!(p.state, TrackState::AtPause { .. }));
+        let b = t.observe(&SpeechUpdate::finalized(
             "you are currently taking warfarin and metformin",
         ));
-        match u.state {
-            TrackState::AtBranch { question, options } => {
-                assert_eq!(question, "any questions");
-                assert_eq!(options, vec!["YES".to_string(), "NO".to_string()]);
-            }
-            other => panic!("expected AtBranch, got {other:?}"),
-        }
+        assert!(matches!(b.state, TrackState::AtBranch { .. }));
     }
 
     #[test]
-    fn selecting_a_branch_fires_once_and_returns_to_main() {
+    fn selecting_a_branch_carries_choice_and_returns_to_main() {
         let mut t = ScriptTracker::new(&sample_script());
         t.observe(&SpeechUpdate::finalized(
             "you are currently taking warfarin and metformin",
         ));
-        // Read the NO option.
         let pick = t.observe(&SpeechUpdate::finalized(
             "okay then lets keep moving along nicely",
         ));
-        assert_eq!(pick.selected_branch_option, Some("NO".to_string()));
         assert_eq!(
-            pick.state,
-            TrackState::InBranch {
-                option_label: "NO".into()
-            }
+            pick.branch_choice,
+            Some(BranchChoice {
+                question: "any questions".into(),
+                option_label: "NO".into(),
+            })
         );
+        assert!(pick.matched);
 
-        // Staying in the branch (a re-read) does not re-fire selection.
+        // Re-reading the option does not re-fire the choice.
         let stay = t.observe(&SpeechUpdate::finalized(
             "okay then lets keep moving along nicely",
         ));
-        assert_eq!(stay.selected_branch_option, None);
+        assert!(stay.branch_choice.is_none());
 
-        // Returning to the main line exits the branch cleanly.
+        // Returning to the main line exits the branch.
         let back = t.observe(&SpeechUpdate::finalized(
             "does this make sense so far for you",
         ));
-        assert_eq!(back.selected_branch_option, None);
+        assert!(back.branch_choice.is_none());
         assert_eq!(back.state, TrackState::Speaking);
         assert_eq!(t.position(), 3);
     }
 
     #[test]
     fn does_not_advance_into_a_future_branch_option() {
-        // Regression for the Phase-2 design flaw: reading a main-line sentence
-        // must NOT jump into a branch option that scores well, because branch
-        // options are not in the main aligner at all.
         let mut t = ScriptTracker::new(&sample_script());
         let u = t.observe(&SpeechUpdate::finalized(
             "great lets discuss your concerns in detail",
         ));
-        // The branch option text does not match any MAIN sentence, so the
-        // cursor stays at the start and no branch is selected.
         assert_eq!(t.position(), 0);
-        assert_eq!(u.selected_branch_option, None);
+        assert!(u.branch_choice.is_none());
     }
 
     #[test]
     fn empty_script_is_neutral() {
-        let t_script = script_from(vec![Section {
+        let mut t = ScriptTracker::new(&script_from(vec![Section {
             name: "Empty".into(),
             word_count: 0,
             elements: vec![],
-        }]);
-        let mut t = ScriptTracker::new(&t_script);
+        }]));
         assert_eq!(t.sentence_count(), 0);
         let u = t.observe(&SpeechUpdate::finalized("anything at all goes here"));
-        assert_eq!(u.state, TrackState::Speaking);
-        assert!(u.selected_branch_option.is_none());
+        assert!(!u.matched);
+        assert!(u.branch_choice.is_none());
     }
 
     #[test]
@@ -665,6 +650,5 @@ mod tests {
         assert!(matches!(t.committed_state, TrackState::AtBranch { .. }));
         t.reset();
         assert_eq!(t.position(), 0);
-        assert_eq!(t.preview_position(), 0);
     }
 }

@@ -43,8 +43,6 @@ pub struct SessionRecorder {
     pauses_reached: HashSet<usize>,
     /// Branch question -> chosen option label.
     branches_taken: HashMap<String, String>,
-    /// The question of the branch currently being decided, if any.
-    pending_branch_question: Option<String>,
     transcript: Vec<TranscriptLine>,
 }
 
@@ -59,6 +57,9 @@ impl SessionRecorder {
 
         for (section_index, section) in script.sections.iter().enumerate() {
             section_names.push(section.name.clone());
+            // A section heading breaks adjacency, mirroring the tracker: a pause
+            // is "reachable" only when a main sentence immediately precedes it.
+            let mut prev_was_main = false;
             for element in &section.elements {
                 match element {
                     Element::Text(sentences) => {
@@ -67,12 +68,24 @@ impl SessionRecorder {
                             sentence_words.push(sentence.word_count);
                             total_words += sentence.word_count;
                         }
+                        prev_was_main = !sentences.is_empty();
                     }
-                    Element::Directive(Directive::Pause { .. }) => pause_total += 1,
+                    // Count only pauses the tracker can actually reach (those
+                    // immediately after a main sentence), so reached/total is an
+                    // honest ratio. Consecutive or branch-adjacent pauses are a
+                    // known limitation (see docs/UPGRADE-2026.md).
+                    Element::Directive(Directive::Pause { .. }) => {
+                        if prev_was_main {
+                            pause_total += 1;
+                        }
+                        prev_was_main = false;
+                    }
                     // Branch option words are optional paths and are not counted
                     // in main-line adherence (consistent with the tracker, which
                     // keeps branch sentences out of the main aligner).
-                    Element::Directive(Directive::Branch { .. }) => {}
+                    Element::Directive(Directive::Branch { .. }) => {
+                        prev_was_main = false;
+                    }
                 }
             }
         }
@@ -89,7 +102,6 @@ impl SessionRecorder {
             covered,
             pauses_reached: HashSet::new(),
             branches_taken: HashMap::new(),
-            pending_branch_question: None,
             transcript: Vec::new(),
         }
     }
@@ -101,44 +113,44 @@ impl SessionRecorder {
             return;
         }
 
-        match &update.state {
-            // Remember the branch question while a choice is pending so the
-            // later selection update can be attributed to it.
-            TrackState::AtBranch { question, .. } => {
-                self.pending_branch_question = Some(question.clone());
-            }
-            TrackState::AtPause { .. } => {
-                if update.sentence_index < self.covered.len() {
-                    self.covered[update.sentence_index] = true;
-                    self.pauses_reached.insert(update.sentence_index);
+        // Coverage / pause evidence counts ONLY on a real match. An unmatched
+        // committed final (off-script speech, a short utterance) must not mark a
+        // sentence delivered -- that was the over-count the cursor-based path had.
+        if update.matched {
+            match &update.state {
+                TrackState::Speaking | TrackState::AtBranch { .. } => {
+                    if update.sentence_index < self.covered.len() {
+                        self.covered[update.sentence_index] = true;
+                    }
                 }
-            }
-            TrackState::Speaking => {
-                if update.sentence_index < self.covered.len() {
-                    self.covered[update.sentence_index] = true;
+                TrackState::AtPause { .. } => {
+                    if update.sentence_index < self.covered.len() {
+                        self.covered[update.sentence_index] = true;
+                        self.pauses_reached.insert(update.sentence_index);
+                    }
                 }
-            }
-            // In-branch / ad-lib updates do not mark a main sentence covered.
-            TrackState::InBranch { .. } | TrackState::AdLibbing => {}
-        }
-
-        // A main sentence reached at a branch boundary is still covered.
-        if matches!(update.state, TrackState::AtBranch { .. })
-            && update.sentence_index < self.covered.len()
-        {
-            self.covered[update.sentence_index] = true;
-        }
-
-        if let Some(label) = &update.selected_branch_option {
-            if let Some(question) = self.pending_branch_question.take() {
-                self.branches_taken.insert(question, label.clone());
+                // In-branch / ad-lib updates do not mark a main sentence covered.
+                TrackState::InBranch { .. } | TrackState::AdLibbing => {}
             }
         }
 
+        // Branch attribution comes straight from the selecting update -- no
+        // stateful reconstruction, so set_position-entered or same-update
+        // selections are not missed and stale questions cannot mis-attribute.
+        if let Some(choice) = &update.branch_choice {
+            self.branches_taken
+                .insert(choice.question.clone(), choice.option_label.clone());
+        }
+
+        // The transcript records every committed final (including off-script
+        // speech) for a complete record; coverage above is what is gated.
         self.transcript.push(TranscriptLine {
             sentence_index: update.sentence_index,
             recognized: recognized.to_string(),
-            branch_option: update.selected_branch_option.clone(),
+            branch_option: update
+                .branch_choice
+                .as_ref()
+                .map(|c| c.option_label.clone()),
         });
     }
 
