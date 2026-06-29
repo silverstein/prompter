@@ -143,24 +143,43 @@ for `isFinal` to scroll. Model choice is the latency budget; alignment compute i
 
 ## 6. Phased plan
 
-- **Phase 1 (pure Rust, this VM, no Mac needed): provider trait + un-orphan the aligner.**
-  Add `speech.rs` (`SpeechProvider` trait, `SpeechUpdate`, `RecognizedWord`, a `MockSpeechProvider`)
-  and `tracker.rs` (`ScriptTracker`: flatten a `Script` into an indexed timeline, wrap
-  `AlignmentEngine`, advance on final + peek on partial to de-flicker, report position + state
-  incl. reaching a Pause/Branch). Add a non-mutating `peek` to `AlignmentEngine`. All CI-testable.
-- **Phase 2: speech-driven pause + branch.** Enforce PAUSE state in the tracker; score the opening
-  lines of each branch option as parallel candidate windows; commit on margin; LLM resync for
-  ambiguous branches.
-- **Phase 3: portable engine.** Implement `SpeechProvider` over sherpa-onnx (hotword-biased to the
-  script's drug list); wire cpal capture in the Tauri backend (in-process, no sidecar) on
-  Win/Linux/Mac. Keep the Apple SpeechAnalyzer sidecar as the macOS fast-path behind the trait.
-- **Phase 4: dual-stream audio + auto-pause.** `OtherPartyDetector` with system-loopback per-OS;
-  pending real call-topology data (D2).
-- **Phase 5: speech-verified compliance + checklist.** Persist the recognized transcript; derive
-  coverage from alignment evidence, not cursor position; trigger-gated checklist over the
-  CMR/OBRA playbook; exam-ready report.
-- **Phase 6: hardening.** Provider error propagation, prompt teardown, offline forced-alignment
-  word-timing map for the report, CSP, cross-platform CI.
+- **Phase 1 — DONE (pure Rust, CI-tested).** `speech.rs` (`SpeechProvider` trait, `SpeechUpdate`,
+  `RecognizedWord`, `MockSpeechProvider`) and `tracker.rs` (`ScriptTracker`: indexed timeline,
+  wraps `AlignmentEngine`, advance-on-final + peek-on-partial de-flicker, reports position +
+  Pause/Branch state). Added a non-mutating `AlignmentEngine::peek`.
+- **Phase 2 — DONE (pure Rust, CI-tested).** Speech-driven branch selection via a
+  Linear -> AwaitingBranch -> InBranch state machine: branch options are scored in isolation
+  (`align::similarity`, threshold + margin), never mixed into the main aligner; reports
+  `InBranch` + a `BranchChoice` (question + label) on selection and detects the return to the
+  main line. (A first cut that flattened options into the aligner was wrong and was rebuilt after
+  adversarial review.) Pause state is reported; full LLM resync for ambiguous branches is deferred.
+- **Phase 3 — STAGED (needs hardware + models).** Implement `SpeechProvider` over sherpa-onnx
+  (hotword-biased to the script's drug list) with in-process `cpal` capture in the Tauri backend
+  on Win/Linux/Mac, and the Apple `SpeechAnalyzer` sidecar as the macOS fast-path. Compiles/runs
+  need ONNX models + a real audio device + (for the Apple path) a Mac, so this is built and
+  validated on hardware, not blind on the headless VM. The trait seam is in place.
+- **Phase 4 — STAGED (needs call-topology data, D2).** `OtherPartyDetector` with system-loopback
+  per-OS (Core Audio taps / WASAPI loopback / PipeWire monitor); optional streaming diarization.
+- **Phase 5 — DONE (pure Rust, CI-tested).** `session.rs` `SessionRecorder`: speech-verified
+  coverage (a sentence counts only on real match evidence, gated by `TrackUpdate.matched`, not
+  cursor position), branch path, reachable-pause counting, persisted transcript, and a
+  speech-verified `ComplianceReport`. The trigger-gated LLM checklist over the CMR/OBRA playbook
+  is the remaining piece (needs an LLM provider).
+- **Phase 6 — PARTIAL.** Evidence gating + de-flicker + empty-input guards are in the core. The
+  macOS app-crate robustness bugs (Swift stderr ignored -> silent permission failure, a UTF-8
+  byte-slice panic in the stdout reader, non-prompt subprocess teardown, CSP disabled) and the
+  offline forced-alignment word-timing map are app-side / hardware-side and remain.
+
+### Known limitations (core, documented intentionally)
+
+- A combined 2-3 sentence aligner window commits the window *start*, so reading two sentences in a
+  single recognized final marks only the first covered (a conservative under-count, the safe
+  direction for compliance). Surfacing the full matched span would need the aligner to return it.
+- Duplicate branch questions and consecutive / branch-adjacent pauses are not individually
+  represented (`branches_taken` and the pause model key on question / preceding-sentence).
+- Branch return-to-main relies on the post-branch sentence being within the aligner's window
+  (~15 sentences) of where the branch left off, which holds for the short guidance branches the
+  DSL targets.
 
 ## 7. References (selected, from the 2026 SOTA research)
 
