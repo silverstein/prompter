@@ -9,6 +9,9 @@ description = "Script parser, alignment engine, and compliance tracker for Promp
 default = ["audio"]
 audio = ["dep:minutes-core"]
 whisper = ["dep:whisper-rs", "audio"]
+# Portable cross-platform on-device ASR (Win/Linux/Mac) via sherpa-onnx
+# streaming Zipformer. Off by default so the pure-logic core stays light.
+sherpa = ["dep:sherpa-onnx"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -20,6 +23,10 @@ minutes-core = { path = "../../../minutes/crates/core", default-features = false
 
 # Whisper (for Tier 2 tracking — uses minutes-core's cpal under the hood)
 whisper-rs = { version = "0.16", optional = true }
+
+# sherpa-onnx streaming Zipformer transducer (first-party Apache-2.0 crate):
+# the portable on-device SpeechProvider baseline. Pulls prebuilt native libs.
+sherpa-onnx = { version = "1.13", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

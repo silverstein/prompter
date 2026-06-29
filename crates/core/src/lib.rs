@@ -5,6 +5,8 @@ pub mod compliance;
 pub mod error;
 pub mod script;
 pub mod session;
+#[cfg(feature = "sherpa")]
+pub mod sherpa;
 pub mod speech;
 pub mod tracker;
 
