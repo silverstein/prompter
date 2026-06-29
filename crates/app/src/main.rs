@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use prompter_core::script::{self, Directive, Element};
-use prompter_core::Vad;
 use serde::Serialize;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -131,158 +130,93 @@ fn parse_script_text(text: String) -> Result<ScriptData, String> {
     Ok(convert_script(parsed))
 }
 
-/// VAD event emitted to the frontend ~10 times per second.
-#[derive(Clone, Serialize)]
-struct VadEvent {
-    speaking: bool,
-    silence_ms: u64,
-    level: u32,
-}
-
-/// Alignment correction event — tells frontend to jump to a position.
-#[derive(Clone, Serialize)]
-struct AlignEvent {
-    position: usize,
-    confidence: f32,
-    ad_libbing: bool,
-}
-
-/// Start audio capture + VAD + Tier 2 alignment.
-/// `sentences` is the flat list of script sentences for alignment matching.
+/// Start speech recognition using Apple's SFSpeechRecognizer via Swift subprocess.
+/// Streams recognized text to the frontend as "speech" events.
 #[tauri::command]
-fn start_audio(app: tauri::AppHandle, sentences: Vec<String>) -> Result<String, String> {
-    // Wait briefly for previous audio thread to finish (e.g., mic test → session transition)
-    for _ in 0..10 {
-        if AUDIO_RUNNING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+fn start_speech(app: tauri::AppHandle) -> Result<String, String> {
     if AUDIO_RUNNING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-        // Already running and couldn't acquire — force stop and retry
+        // Kill previous
         AUDIO_STOP.store(true, Ordering::SeqCst);
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        AUDIO_RUNNING.store(false, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(300));
         AUDIO_RUNNING.store(true, Ordering::SeqCst);
     }
-
     AUDIO_STOP.store(false, Ordering::SeqCst);
-
     let stop = Arc::clone(&AUDIO_STOP);
 
-    // Try to load whisper model for Tier 2 tracking
-    let model_path = dirs_next::home_dir()
-        .unwrap_or_default()
-        .join(".config/minutes/models/ggml-tiny.bin");
+    // Find the speech-recognizer binary (bundled next to the app binary)
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_default();
+    let recognizer_path = exe_dir.join("speech-recognizer");
+
+    if !recognizer_path.exists() {
+        return Err(format!("Speech recognizer not found at {}", recognizer_path.display()));
+    }
 
     std::thread::spawn(move || {
-        let stream = match prompter_core::AudioStream::start() {
-            Ok(s) => s,
+        use std::io::BufRead;
+
+        eprintln!("[prompter] Starting speech recognizer: {}", recognizer_path.display());
+
+        let mut child = match std::process::Command::new(&recognizer_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
             Err(e) => {
-                let _ = app.emit("vad-error", format!("{}", e));
+                eprintln!("[prompter] Failed to spawn speech recognizer: {}", e);
+                let _ = app.emit("speech-error", format!("{}", e));
                 AUDIO_RUNNING.store(false, Ordering::Relaxed);
                 return;
             }
         };
 
-        let _ = app.emit("audio-started", &stream.device_name);
+        let stdout = child.stdout.take().unwrap();
+        let reader = std::io::BufReader::new(stdout);
 
-        // Initialize Tier 2 (optional — degrades gracefully if no model)
-        let mut transcriber = prompter_core::StreamingTranscriber::new(&model_path).ok();
-        let mut aligner = if !sentences.is_empty() {
-            Some(prompter_core::AlignmentEngine::new(sentences))
-        } else {
-            None
-        };
-
-        if transcriber.is_some() {
-            let _ = app.emit("tier2-ready", true);
-        }
-
-        let rx = stream.receiver.clone();
-        let mut vad = Vad::new();
-        let mut speech_buffer: Vec<f32> = Vec::new();
-        let mut was_speaking = false;
-
-        loop {
+        for line in reader.lines() {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
 
-            match rx.recv_timeout(std::time::Duration::from_millis(150)) {
-                Ok(chunk) => {
-                    let result = vad.process(chunk.rms);
+            if let Ok(line) = line {
+                eprintln!("[prompter] Speech: {}", &line[..line.len().min(100)]);
+                // Parse JSON and emit to frontend
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if let Some(text) = val.get("text").and_then(|t| t.as_str()) {
+                        let is_final = val.get("final").and_then(|f| f.as_bool()).unwrap_or(false);
 
-                    // Emit VAD event (Tier 1)
-                    let _ = app.emit(
-                        "vad",
-                        VadEvent {
-                            speaking: result.speaking,
-                            silence_ms: result.silence_ms,
-                            level: (result.energy * 2000.0).min(100.0) as u32,
-                        },
-                    );
-
-                    // Tier 2: accumulate speech samples, transcribe on silence boundary
-                    if result.speaking {
-                        speech_buffer.extend_from_slice(&chunk.samples);
-                        was_speaking = true;
-
-                        // Cap buffer at ~10 seconds to prevent OOM
-                        if speech_buffer.len() > 160000 {
-                            // Transcribe what we have and reset
-                            if let (Some(ref mut t), Some(ref mut a)) = (&mut transcriber, &mut aligner) {
-                                if let Ok(text) = t.transcribe_chunk(&speech_buffer) {
-                                    if !text.is_empty() {
-                                        let ar = a.align(&text);
-                                        let _ = app.emit("align", AlignEvent {
-                                            position: ar.position,
-                                            confidence: ar.confidence,
-                                            ad_libbing: ar.ad_libbing,
-                                        });
-                                    }
-                                }
-                            }
-                            speech_buffer.clear();
+                        #[derive(Clone, Serialize)]
+                        struct SpeechEvent {
+                            text: String,
+                            is_final: bool,
                         }
-                    } else if was_speaking && result.silence_ms >= 300 {
-                        // Speech just ended — transcribe the accumulated buffer
-                        was_speaking = false;
 
-                        if speech_buffer.len() >= 8000 {
-                            // At least 0.5s of audio
-                            if let (Some(ref mut t), Some(ref mut a)) = (&mut transcriber, &mut aligner) {
-                                if let Ok(text) = t.transcribe_chunk(&speech_buffer) {
-                                    if !text.is_empty() {
-                                        let ar = a.align(&text);
-                                        let _ = app.emit("align", AlignEvent {
-                                            position: ar.position,
-                                            confidence: ar.confidence,
-                                            ad_libbing: ar.ad_libbing,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        speech_buffer.clear();
+                        let _ = app.emit("speech", SpeechEvent {
+                            text: text.to_string(),
+                            is_final,
+                        });
                     }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
 
-        drop(stream);
+        // Clean up
+        let _ = child.kill();
+        let _ = child.wait();
         AUDIO_RUNNING.store(false, Ordering::Relaxed);
+        eprintln!("[prompter] Speech recognizer stopped");
     });
 
-    Ok("starting".into())
+    Ok("started".into())
 }
 
-/// Stop audio capture.
+/// Stop speech recognition.
 #[tauri::command]
-fn stop_audio() -> Result<(), String> {
-    AUDIO_STOP.store(true, Ordering::Relaxed);
+fn stop_speech() -> Result<(), String> {
+    AUDIO_STOP.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -607,8 +541,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             load_script,
             parse_script_text,
-            start_audio,
-            stop_audio,
+            start_speech,
+            stop_speech,
             save_compliance,
             get_coaching,
             load_settings,

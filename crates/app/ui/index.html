@@ -226,8 +226,7 @@ function loadScript(data){
   show('nav'); show('startBar'); show('tp');
   hide('empty'); hide('status'); hide('doneOverlay');
 
-  // Start mic test so user can see the bars respond before starting session
-  startMicTest();
+  // Web Speech API handles mic access when session starts
 }
 
 // ── Mic test (pre-session) ──
@@ -274,23 +273,13 @@ async function startSession(){
   state='run'; t0=Date.now(); secTimes={0:Date.now()};
   hide('startBar'); show('status');
 
-  // Start audio capture for VAD-controlled scroll
-  const sentences = items.filter(it=>it.kind==='s').map(it=>it.text);
-  try{
-    await invoke('start_audio', { sentences });
-    audioMode = true;
-    setupVadListener();
-    setupAlignListener();
-  }catch(e){
-    // No mic? Fall back to timer-based scroll
-    audioMode = false;
-    startScroll();
-  }
+  // Start Apple Speech recognition for real-time tracking
+  startAppleSpeech();
 
   updateSt(); startClock();
 }
 function resetAll(){
-  stopScroll(); stopClock(); cleanupVad();
+  stopScroll(); stopClock(); stopAppleSpeech();
   script=null; items=[]; idx=0; state='idle';
   hide('nav'); hide('tp'); hide('startBar'); hide('status'); hide('doneOverlay');
   show('empty');
@@ -321,107 +310,86 @@ function trackSection(){
   if(si!==undefined && secTimes[si]===undefined) secTimes[si]=Date.now();
 }
 
-// ── VAD-controlled scroll ──
-let vadUnlisten = null;
-let vadWordAccum = 0;  // accumulate "spoken words" based on speaking time
+// ── Apple Speech Recognition (via Swift subprocess) ──
+// SFSpeechRecognizer streams recognized text in real-time.
+// We match spoken words against script sentences to track position.
 
-function setupVadListener(){
-  if(vadUnlisten) return;
-  listen('vad', (event)=>{
-    const {speaking, silence_ms, level} = event.payload;
-    vadSpeaking = speaking;
+let speechUnlisten = null;
 
-    // Update audio visualizer bars
-    const viz = els.audioViz;
-    if(viz){
-      const bars = viz.querySelectorAll('.bar');
-      const l = Math.min(level, 100);
-      bars.forEach((bar, i) => {
-        // Each bar gets a slightly different height for a natural waveform look
-        const jitter = Math.sin(Date.now()/100 + i*1.5) * 0.3 + 0.7;
-        const h = speaking ? Math.max(2, l * jitter * 0.22) : 2;
-        bar.style.height = h + 'px';
-        bar.style.background = speaking ? 'var(--green)' : 'var(--text-muted)';
-      });
-    }
+async function startAppleSpeech(){
+  try{
+    await invoke('start_speech');
+    audioMode = true;
 
-    if(state!=='run' && state!=='wait') return;
+    speechUnlisten = await listen('speech', (event)=>{
+      const {text, is_final} = event.payload;
+      if(state!=='run') return;
+      if(!text || text.length < 5) return;
 
-    if(speaking && state==='run'){
-      // Accumulate "speaking time" — each VAD tick is ~100ms
-      // At 150 WPM, that's 2.5 words/sec, so ~0.25 words per 100ms tick
-      vadWordAccum += speed / 600; // words per 100ms at current WPM
+      // Update visualizer
+      const viz = els.audioViz;
+      if(viz){
+        viz.querySelectorAll('.bar').forEach((bar,i)=>{
+          bar.style.height = (4 + Math.random()*14)+'px';
+          bar.style.background = 'var(--green)';
+        });
+      }
 
-      // Advance when we've accumulated enough words for the current sentence
-      const currentWords = items[idx]?.words || 5;
-      if(vadWordAccum >= currentWords){
-        vadWordAccum -= currentWords;
-        if(idx < items.length - 1){
-          idx++; trackSection();
-          if(items[idx]?.kind==='p'){state='wait';updateSt();highlight();return}
-          highlight();
-        } else {
-          endSession();
+      // Show what we're hearing in status
+      if(els.stCurText) els.stCurText.textContent = text.substring(text.length-40);
+
+      // Match last few words against nearby sentences
+      const spoken = text.toLowerCase().replace(/[^a-z0-9 ]/g,'');
+      const words = spoken.split(/\s+/).slice(-6); // last 6 words
+
+      if(words.length < 2) return;
+
+      // Search forward from current position
+      const searchStart = Math.max(0, idx - 1);
+      const searchEnd = Math.min(items.length, idx + 12);
+      let bestIdx = -1;
+      let bestScore = 0;
+
+      for(let i=searchStart; i<searchEnd; i++){
+        if(items[i].kind!=='s') continue;
+        const sentText = items[i].text.toLowerCase().replace(/[^a-z0-9 ]/g,'');
+
+        let matches = 0;
+        for(const w of words){
+          if(w.length > 2 && sentText.includes(w)) matches++;
+        }
+        const score = words.length > 0 ? matches / words.length : 0;
+
+        if(score > bestScore && score > 0.3){
+          bestScore = score;
+          bestIdx = i;
         }
       }
-    } else if(!speaking && state==='wait'){
-      // At a pause marker and silence detected — this is expected
-      // (patient is about to respond, or pharmacist paused for them)
-    }
-  }).then(fn => { vadUnlisten = fn });
 
-  listen('vad-error', (event)=>{
+      // Only advance forward
+      if(bestIdx > idx){
+        idx = bestIdx;
+        trackSection();
+        highlight();
+      }
+    });
+
+    // Listen for errors
+    listen('speech-error', (event)=>{
+      showErr('Speech recognition: ' + event.payload);
+      audioMode = false;
+      startScroll(); // fallback
+    }).then(()=>{});
+
+  }catch(e){
     audioMode = false;
-    startScroll(); // fall back to timer
-  }).then(()=>{});
+    startScroll(); // fallback to timer
+  }
 }
 
-// ── Tier 2: alignment listener ──
-let alignUnlisten = null;
-let tier2Active = false;
-
-function setupAlignListener(){
-  listen('tier2-ready', ()=>{ tier2Active = true; }).then(()=>{});
-
-  listen('align', (event)=>{
-    const {position, confidence, ad_libbing} = event.payload;
-
-    // Update visualizer bar color based on alignment confidence
-    const viz = els.audioViz;
-    if(viz){
-      const color = ad_libbing ? 'var(--amber)' : confidence > 0.5 ? 'var(--green)' : confidence > 0.3 ? 'var(--amber)' : 'var(--red)';
-      viz.querySelectorAll('.bar').forEach(b => b.style.background = color);
-    }
-
-    if(state!=='run' && state!=='wait') return;
-    if(!tier2Active) return;
-
-    // Only correct if confident and position is ahead of current
-    if(confidence > 0.4 && position > idx){
-      // Map alignment position (sentence-only index) back to items index
-      let sentenceCount = 0;
-      for(let i=0; i<items.length; i++){
-        if(items[i].kind==='s'){
-          if(sentenceCount === position){
-            idx = i;
-            trackSection();
-            highlight();
-            vadWordAccum = 0;
-            break;
-          }
-          sentenceCount++;
-        }
-      }
-    }
-  }).then(fn => { alignUnlisten = fn });
-}
-
-function cleanupVad(){
-  if(vadUnlisten){vadUnlisten();vadUnlisten=null}
-  if(alignUnlisten){alignUnlisten();alignUnlisten=null}
-  vadWordAccum = 0;
-  tier2Active = false;
-  invoke('stop_audio').catch(()=>{});
+function stopAppleSpeech(){
+  if(speechUnlisten){speechUnlisten();speechUnlisten=null}
+  invoke('stop_speech').catch(()=>{});
   audioMode = false;
 }
 
@@ -444,7 +412,7 @@ function toggle(){
 
 // ── End session ──
 function endSession(){
-  state='done'; stopScroll(); stopClock(); cleanupVad(); updateSt();
+  state='done'; stopScroll(); stopClock(); stopAppleSpeech(); updateSt();
   const elapsed = t0 ? Math.floor((Date.now()-t0)/1000) : 0;
   const card = els.doneCard;
   while(card.firstChild) card.removeChild(card.firstChild);
@@ -678,16 +646,19 @@ function highlight(){
     else if(i===idx) el.classList.add('cur');
     else el.classList.add('up');
   });
-  // Pin current sentence to ~35% from top of viewport (not center —
-  // lets you see more upcoming text, like a real teleprompter)
+  // Smooth scroll: pin current sentence to ~30% from top.
+  // Only scroll if the current sentence is outside the target zone.
   const cur=document.querySelector('.s.cur');
   if(cur){
     const tp=els.tp;
     const tpRect=tp.getBoundingClientRect();
     const curRect=cur.getBoundingClientRect();
-    const targetY=tpRect.top + tpRect.height * 0.35;
+    const targetY=tpRect.top + tpRect.height * 0.30;
     const offset=curRect.top - targetY;
-    tp.scrollBy({top:offset, behavior:'smooth'});
+    // Only scroll if more than 20px off target (prevents jitter)
+    if(Math.abs(offset) > 20){
+      tp.scrollBy({top:offset, behavior:'smooth'});
+    }
   }
 
   document.querySelectorAll('.pause[data-i]').forEach(el=>{
