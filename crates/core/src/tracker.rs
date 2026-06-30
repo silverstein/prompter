@@ -335,8 +335,12 @@ impl ScriptTracker {
             // No option chosen -> fall through to main alignment.
         }
 
-        // Normal main-line alignment.
-        let prev = self.committed;
+        // Normal main-line alignment. Floor the forward-jump cap at the live
+        // cursor (`preview`), not just `committed`: during a run of partials the
+        // preview has already advanced past the (stale) committed floor, and a
+        // final must be free to confirm there instead of snapping back to
+        // committed + MAX_ADVANCE.
+        let prev = self.committed.max(self.preview);
         let result = self.engine.align(text);
         // Cap the forward jump so one false match can't fling the cursor far.
         if self.engine.position() > prev + MAX_ADVANCE {
@@ -374,11 +378,23 @@ impl ScriptTracker {
         }
         let result = self.engine.peek(text);
         if result.matched {
-            // Forward-only, monotonic, and capped: a partial can preview ahead
-            // but never past committed + MAX_ADVANCE (no spurious far jump).
-            let capped = result.position.min(self.committed + MAX_ADVANCE);
+            // Forward-only, monotonic, rate-limited: a partial can preview ahead
+            // but at most MAX_ADVANCE past the *live cursor* (`preview`) per
+            // update, so one noisy partial can't fling the cursor far.
+            //
+            // The cap is measured from `preview`, NOT `committed`: Apple's
+            // recognizer only emits `isFinal` at long pauses, so during
+            // continuous reading `committed` never advances. A committed-anchored
+            // cap froze the cursor permanently at committed + MAX_ADVANCE (the
+            // "prompter never budges" bug). See tracker tests + examples/replay.
+            let capped = result.position.min(self.preview + MAX_ADVANCE);
             if capped > self.preview {
                 self.preview = capped;
+                // Slide the engine's search window forward to follow the reader.
+                // The window is centered on the engine cursor, which otherwise
+                // only moves on finals; without this, a read longer than the
+                // window radius re-freezes at the window edge.
+                self.engine.set_position(self.preview);
             }
         }
         let timeline_index = self
@@ -566,6 +582,57 @@ mod tests {
         ));
         assert!(u.committed && u.matched);
         assert_eq!(u.sentence_index, 2);
+    }
+
+    #[test]
+    fn partials_only_keep_advancing_past_max_advance() {
+        // Apple's SFSpeechRecognizer emits only volatile partials during
+        // continuous reading (no `isFinal` until a long pause). The cursor must
+        // still track forward across the whole script. A committed-anchored cap
+        // previously froze the preview at committed + MAX_ADVANCE (idx 4) because
+        // `committed` only advances on finals -- the "prompter never budges" bug
+        // captured in the real recording under examples/replay.
+        let sentences = [
+            "hi thanks for meeting with me today i appreciate it",
+            "my goal is simple to keep every medication safe and effective",
+            "i understand you have been feeling dizzy lately and bruising",
+            "it sounds like these symptoms have been worrying you a lot",
+            "i reviewed your profile and found a few critical interactions",
+            "your warfarin and garlic together raise your risk of bleeding",
+            "the saint johns wort can make your other medicines weaker",
+            "lets walk through a simple plan to fix this together today",
+            "first we will adjust the timing of your evening doses",
+            "then we will follow up next week to confirm improvement",
+        ];
+        let script = script_from(vec![Section {
+            name: "Body".into(),
+            word_count: 0,
+            elements: vec![Element::Text(sentences.iter().map(|s| sent(s)).collect())],
+        }]);
+        let mut t = ScriptTracker::new(&script);
+        t.set_window_radius(10);
+
+        // Read the whole script as a growing cumulative partial, feeding only
+        // the leading edge (like the app's `recent_words(text, 10)`), NO finals.
+        let mut spoken: Vec<&str> = Vec::new();
+        let mut last = 0usize;
+        for s in &sentences {
+            for word in s.split_whitespace() {
+                spoken.push(word);
+                let start = spoken.len().saturating_sub(10);
+                let lead = spoken[start..].join(" ");
+                let u = t.observe(&SpeechUpdate::partial(lead));
+                assert!(!u.committed, "partials must never commit");
+                last = u.sentence_index;
+            }
+        }
+        // With no finals at all, the cursor must have tracked to (near) the last
+        // sentence -- far past the old committed + MAX_ADVANCE ceiling of 4.
+        assert!(
+            last >= sentences.len() - 2,
+            "partials-only cursor froze at idx {last}, expected >= {}",
+            sentences.len() - 2
+        );
     }
 
     #[test]
