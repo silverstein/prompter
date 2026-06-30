@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use prompter_core::script::{self, Directive, Element};
+use prompter_core::{ScriptTracker, SessionRecorder, SpeechUpdate, TrackState, TrackUpdate};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tauri::Emitter;
+use std::sync::{Arc, Mutex};
+use tauri::{Emitter, Manager};
 
 // ── Serializable types for the frontend ──
 
@@ -16,6 +18,9 @@ struct ScriptData {
     estimated_duration: Option<String>,
     sections: Vec<SectionData>,
     word_count: usize,
+    /// The raw .script.md source, so the frontend can hand it back to
+    /// `init_tracking` (which parses it into a tracker) without re-reading.
+    source: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,12 +56,13 @@ struct BranchOptionData {
     sentences: Vec<SentenceData>,
 }
 
-fn convert_script(s: script::Script) -> ScriptData {
+fn convert_script(s: script::Script, source: String) -> ScriptData {
     ScriptData {
         title: s.frontmatter.title,
         version: s.frontmatter.version,
         estimated_duration: s.frontmatter.estimated_duration,
         word_count: s.word_count,
+        source,
         sections: s
             .sections
             .into_iter()
@@ -121,20 +127,156 @@ static AUDIO_STOP: std::sync::LazyLock<Arc<AtomicBool>> =
 fn load_script(path: String) -> Result<ScriptData, String> {
     let content = fs::read_to_string(&path).map_err(|e| format!("Could not read file: {}", e))?;
     let parsed = script::parse(&content).map_err(|e| format!("{}", e))?;
-    Ok(convert_script(parsed))
+    Ok(convert_script(parsed, content))
 }
 
 #[tauri::command]
 fn parse_script_text(text: String) -> Result<ScriptData, String> {
     let parsed = script::parse(&text).map_err(|e| format!("{}", e))?;
-    Ok(convert_script(parsed))
+    Ok(convert_script(parsed, text))
+}
+
+// ── Rust-side script tracking (the canonical aligner) ──
+//
+// The frontend renders the script and (for now) still drives the visible scroll
+// with its own matcher, but the recognized speech is also fed here so coverage
+// and the compliance report come from real alignment evidence, not the cursor
+// position. `track-update` events are emitted for the UI to consume.
+
+struct TrackingSession {
+    tracker: ScriptTracker,
+    recorder: SessionRecorder,
+}
+
+#[derive(Default)]
+struct TrackingState(Mutex<Option<TrackingSession>>);
+
+/// Tauri event payload for one tracker update.
+#[derive(Clone, Serialize)]
+struct TrackEvent {
+    sentence_index: usize,
+    timeline_index: usize,
+    committed: bool,
+    matched: bool,
+    state: String,
+    prompt: Option<String>,
+    question: Option<String>,
+    options: Option<Vec<String>>,
+    option_label: Option<String>,
+    branch_question: Option<String>,
+    selected_option: Option<String>,
+}
+
+fn track_event(u: &TrackUpdate) -> TrackEvent {
+    let (state, prompt, question, options, option_label) = match &u.state {
+        TrackState::Speaking => ("speaking", None, None, None, None),
+        TrackState::AtPause { prompt } => ("pause", Some(prompt.clone()), None, None, None),
+        TrackState::AtBranch { question, options } => (
+            "branch",
+            None,
+            Some(question.clone()),
+            Some(options.clone()),
+            None,
+        ),
+        TrackState::InBranch { option_label } => {
+            ("in_branch", None, None, None, Some(option_label.clone()))
+        }
+        TrackState::AdLibbing => ("adlib", None, None, None, None),
+    };
+    TrackEvent {
+        sentence_index: u.sentence_index,
+        timeline_index: u.timeline_index,
+        committed: u.committed,
+        matched: u.matched,
+        state: state.to_string(),
+        prompt,
+        question,
+        options,
+        option_label,
+        branch_question: u.branch_choice.as_ref().map(|c| c.question.clone()),
+        selected_option: u.branch_choice.as_ref().map(|c| c.option_label.clone()),
+    }
+}
+
+/// Start a tracking session for `text` (the .script.md source).
+#[tauri::command]
+fn init_tracking(state: tauri::State<TrackingState>, text: String) -> Result<(), String> {
+    let parsed = script::parse(&text).map_err(|e| format!("{}", e))?;
+    let session = TrackingSession {
+        tracker: ScriptTracker::new(&parsed),
+        recorder: SessionRecorder::new(&parsed),
+    };
+    *state.0.lock().map_err(|_| "tracking state poisoned")? = Some(session);
+    Ok(())
+}
+
+/// Speech-verified compliance report returned to the frontend at session end.
+#[derive(Clone, Serialize)]
+struct ComplianceOut {
+    script_title: String,
+    script_version: Option<String>,
+    sections_covered: Vec<String>,
+    sections_skipped: Vec<String>,
+    duration_secs: u64,
+    pause_points_reached: usize,
+    pause_points_total: usize,
+    branches_taken: HashMap<String, String>,
+    total_words: usize,
+    words_delivered: usize,
+    adherence_pct: f64,
+    saved_path: String,
+    transcript_markdown: String,
+}
+
+/// Finish the tracking session: build the speech-verified compliance report,
+/// write it (and the transcript) to disk, and return it.
+#[tauri::command]
+fn finish_tracking(
+    state: tauri::State<TrackingState>,
+    duration_secs: u64,
+) -> Result<ComplianceOut, String> {
+    let guard = state.0.lock().map_err(|_| "tracking state poisoned")?;
+    let session = guard
+        .as_ref()
+        .ok_or("no active tracking session (call init_tracking first)")?;
+
+    let report = session.recorder.build_report(duration_secs);
+    let transcript = session.recorder.transcript_markdown();
+
+    let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = home.join("meetings").join("consults");
+    let path = report
+        .write_to_dir(&dir)
+        .map_err(|e| format!("Failed to save compliance report: {}", e))?;
+    // Best-effort transcript artifact next to the report.
+    let transcript_path = path.with_extension("transcript.md");
+    let _ = fs::write(&transcript_path, &transcript);
+
+    Ok(ComplianceOut {
+        script_title: report.script_title.clone(),
+        script_version: report.script_version.clone(),
+        sections_covered: report.sections_covered.clone(),
+        sections_skipped: report.sections_skipped.clone(),
+        duration_secs: report.duration_secs,
+        pause_points_reached: report.pause_points_reached,
+        pause_points_total: report.pause_points_total,
+        branches_taken: report.branches_taken.clone(),
+        total_words: report.total_words,
+        words_delivered: report.words_delivered,
+        adherence_pct: report.adherence_pct(),
+        saved_path: path.to_string_lossy().to_string(),
+        transcript_markdown: transcript,
+    })
 }
 
 /// Start speech recognition using Apple's SFSpeechRecognizer via Swift subprocess.
 /// Streams recognized text to the frontend as "speech" events.
 #[tauri::command]
 fn start_speech(app: tauri::AppHandle) -> Result<String, String> {
-    if AUDIO_RUNNING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+    if AUDIO_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         // Kill previous
         AUDIO_STOP.store(true, Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -151,13 +293,19 @@ fn start_speech(app: tauri::AppHandle) -> Result<String, String> {
     let recognizer_path = exe_dir.join("speech-recognizer");
 
     if !recognizer_path.exists() {
-        return Err(format!("Speech recognizer not found at {}", recognizer_path.display()));
+        return Err(format!(
+            "Speech recognizer not found at {}",
+            recognizer_path.display()
+        ));
     }
 
     std::thread::spawn(move || {
         use std::io::BufRead;
 
-        eprintln!("[prompter] Starting speech recognizer: {}", recognizer_path.display());
+        eprintln!(
+            "[prompter] Starting speech recognizer: {}",
+            recognizer_path.display()
+        );
 
         let mut child = match std::process::Command::new(&recognizer_path)
             .stdout(std::process::Stdio::piped())
@@ -194,10 +342,28 @@ fn start_speech(app: tauri::AppHandle) -> Result<String, String> {
                             is_final: bool,
                         }
 
-                        let _ = app.emit("speech", SpeechEvent {
-                            text: text.to_string(),
-                            is_final,
-                        });
+                        let _ = app.emit(
+                            "speech",
+                            SpeechEvent {
+                                text: text.to_string(),
+                                is_final,
+                            },
+                        );
+
+                        // Feed the canonical Rust tracker: accumulate compliance
+                        // evidence and emit a track-update for the UI.
+                        let tstate = app.state::<TrackingState>();
+                        if let Ok(mut guard) = tstate.0.lock() {
+                            if let Some(session) = guard.as_mut() {
+                                let update = session.tracker.observe(&SpeechUpdate {
+                                    text: text.to_string(),
+                                    words: Vec::new(),
+                                    is_final,
+                                });
+                                session.recorder.record(&update, text);
+                                let _ = app.emit("track-update", track_event(&update));
+                            }
+                        }
                     }
                 }
             }
@@ -281,8 +447,12 @@ struct Settings {
     recent_scripts: Vec<RecentScript>,
 }
 
-fn default_font_size() -> u32 { 34 }
-fn default_speed() -> u32 { 150 }
+fn default_font_size() -> u32 {
+    34
+}
+fn default_speed() -> u32 {
+    150
+}
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 struct RecentScript {
@@ -320,14 +490,17 @@ fn add_recent_script(path: String, title: String) -> Result<(), String> {
     settings.recent_scripts.retain(|r| r.path != path);
 
     // Add to front
-    settings.recent_scripts.insert(0, RecentScript {
-        path,
-        title,
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    });
+    settings.recent_scripts.insert(
+        0,
+        RecentScript {
+            path,
+            title,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        },
+    );
 
     // Keep max 10
     settings.recent_scripts.truncate(10);
@@ -372,7 +545,8 @@ fn list_available_scripts() -> Vec<RecentScript> {
                             .to_string()
                     };
 
-                    let modified = entry.metadata()
+                    let modified = entry
+                        .metadata()
                         .ok()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -509,6 +683,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_deep_link::init())
+        .manage(TrackingState::default())
         .setup(|app| {
             use tauri::Listener;
             // Handle deep links (prompter://open?file=... or prompter://open?consultation_id=...)
@@ -526,8 +701,10 @@ fn main() {
                                     if let Some(path) = find_script_by_consultation_id(&value) {
                                         let _ = handle.emit("deep-link-open", path);
                                     } else {
-                                        let _ = handle.emit("deep-link-error",
-                                            format!("No script found for consultation {}", value));
+                                        let _ = handle.emit(
+                                            "deep-link-error",
+                                            format!("No script found for consultation {}", value),
+                                        );
                                     }
                                 }
                                 _ => {}
@@ -541,6 +718,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             load_script,
             parse_script_text,
+            init_tracking,
+            finish_tracking,
             start_speech,
             stop_speech,
             save_compliance,

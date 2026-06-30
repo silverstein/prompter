@@ -273,6 +273,13 @@ async function startSession(){
   state='run'; t0=Date.now(); secTimes={0:Date.now()};
   hide('startBar'); show('status');
 
+  // Build the canonical Rust tracker for this session (speech-verified coverage
+  // + compliance). Best-effort: if it fails, the live scroll still works and we
+  // fall back to the cursor-derived report at endSession.
+  if(script && script.source){
+    await invoke('init_tracking', {text: script.source}).catch(()=>{});
+  }
+
   // Start Apple Speech recognition for real-time tracking
   startAppleSpeech();
 
@@ -465,7 +472,7 @@ function endSession(){
     if(items[i].kind==='p') pauseReached++;
   }
 
-  invoke('save_compliance', { report: {
+  const jsReport = {
     script_title: script.title,
     script_version: script.version || null,
     sections_covered: covered,
@@ -477,28 +484,37 @@ function endSession(){
     branches_taken: branchDecisions,
     total_words: script.word_count,
     words_delivered: wordsDelivered
-  }}).then(path => {
-    // Show saved path
+  };
+  function showSavedPath(path){
     const saved = document.createElement('div');
     saved.style.cssText = 'font-size:12px;color:var(--text-muted);margin-top:12px';
     saved.textContent = 'Report saved to '+path;
     card.appendChild(saved);
-  }).catch(e=>{showErr('Compliance report not saved: '+e)});
+  }
+  // Prefer the speech-verified report from the Rust tracker; fall back to the
+  // cursor-derived JS report if tracking was not initialized this session.
+  invoke('finish_tracking', { durationSecs: elapsed }).then(rep => {
+    showSavedPath(rep.saved_path);
+    invoke('get_coaching', { report: {
+      script_title: rep.script_title,
+      script_version: rep.script_version || null,
+      sections_covered: rep.sections_covered,
+      sections_skipped: rep.sections_skipped,
+      duration_secs: rep.duration_secs,
+      section_times: sectionTimesMap,
+      pause_points_reached: rep.pause_points_reached,
+      pause_points_total: rep.pause_points_total,
+      branches_taken: rep.branches_taken,
+      total_words: rep.total_words,
+      words_delivered: rep.words_delivered
+    }}).then(renderCoaching).catch(e=>{console.warn('coaching:',e)});
+  }).catch(()=>{
+    invoke('save_compliance', { report: jsReport }).then(showSavedPath).catch(e=>{showErr('Compliance report not saved: '+e)});
+    invoke('get_coaching', { report: jsReport }).then(renderCoaching).catch(e=>{console.warn('coaching:',e)});
+  });
 
-  // Fetch coaching insights
-  invoke('get_coaching', { report: {
-    script_title: script.title,
-    script_version: script.version || null,
-    sections_covered: covered,
-    sections_skipped: skipped,
-    duration_secs: elapsed,
-    section_times: sectionTimesMap,
-    pause_points_reached: pauseReached,
-    pause_points_total: pauseTotal,
-    branches_taken: branchDecisions,
-    total_words: script.word_count,
-    words_delivered: wordsDelivered
-  }}).then(insights => {
+  // Coaching renderer (used by both the speech-verified and fallback paths).
+  function renderCoaching(insights){
     if(!insights || !insights.length) return;
     const coachDiv = document.createElement('div');
     coachDiv.style.cssText = 'text-align:left;margin-bottom:20px;padding:12px;background:var(--bg);border-radius:var(--radius-sm);border:1px solid var(--border-subtle)';
@@ -529,7 +545,7 @@ function endSession(){
     const doneBtn = card.querySelector('.btn-primary');
     if(doneBtn) card.insertBefore(coachDiv, doneBtn);
     else card.appendChild(coachDiv);
-  }).catch(e=>{/* coaching is non-critical — log but don't alarm */console.warn('coaching:',e)});
+  }
 
   const btn=document.createElement('button');
   btn.className='btn-primary'; btn.textContent='Done';
