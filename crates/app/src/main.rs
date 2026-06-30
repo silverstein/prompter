@@ -351,18 +351,25 @@ fn start_speech(app: tauri::AppHandle) -> Result<String, String> {
                         );
 
                         // Feed the canonical Rust tracker: accumulate compliance
-                        // evidence and emit a track-update for the UI.
-                        let tstate = app.state::<TrackingState>();
-                        if let Ok(mut guard) = tstate.0.lock() {
-                            if let Some(session) = guard.as_mut() {
-                                let update = session.tracker.observe(&SpeechUpdate {
+                        // evidence, then emit a track-update for the UI. The
+                        // lock guard is dropped at the end of this block, before
+                        // the emit, to avoid holding it across the borrow.
+                        let track = {
+                            let tstate = app.state::<TrackingState>();
+                            let mut guard = tstate.0.lock().ok();
+                            let session = guard.as_mut().and_then(|g| g.as_mut());
+                            session.map(|s| {
+                                let update = s.tracker.observe(&SpeechUpdate {
                                     text: text.to_string(),
                                     words: Vec::new(),
                                     is_final,
                                 });
-                                session.recorder.record(&update, text);
-                                let _ = app.emit("track-update", track_event(&update));
-                            }
+                                s.recorder.record(&update, text);
+                                track_event(&update)
+                            })
+                        };
+                        if let Some(ev) = track {
+                            let _ = app.emit("track-update", ev);
                         }
                     }
                 }
