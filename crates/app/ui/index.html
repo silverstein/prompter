@@ -111,6 +111,8 @@ let vadAdvanceTimer = null;  // accumulates speaking time to advance sentences
 // ── State ──
 let script = null;
 let items = [];          // flat array of {text, words, section, kind:'s'|'p'}
+let mainSentenceItemIdx = []; // tracker sentence_index -> items index
+let trackUnlisten = null;     // 'track-update' (Rust tracker) subscription
 let idx = 0;
 let state = 'idle';      // idle | loaded | run | pause | wait | done
 let speed = 150;
@@ -214,9 +216,17 @@ function loadScript(data){
   stopScroll(); stopClock();
   state = 'loaded';
   items = [];
+  // Map each main-line sentence (the tracker's sentence_index) to its index in
+  // `items`, so track-update events can position the highlight. The tracker and
+  // this list both walk Text sentences in document order (branches excluded), so
+  // the n-th 's' item is the n-th tracker sentence.
+  mainSentenceItemIdx = [];
   data.sections.forEach((sec,si)=>{
     sec.elements.forEach(el=>{
-      if(el.type==='text') el.sentences.forEach(s=>items.push({text:s.text,words:s.word_count,section:si,kind:'s'}));
+      if(el.type==='text') el.sentences.forEach(s=>{
+        mainSentenceItemIdx.push(items.length);
+        items.push({text:s.text,words:s.word_count,section:si,kind:'s'});
+      });
       else if(el.type==='pause') items.push({text:el.prompt,words:0,section:si,kind:'p'});
     });
   });
@@ -345,37 +355,20 @@ async function startAppleSpeech(){
       // Show what we're hearing in status
       if(els.stCurText) els.stCurText.textContent = text.substring(text.length-40);
 
-      // Match last few words against nearby sentences
-      const spoken = text.toLowerCase().replace(/[^a-z0-9 ]/g,'');
-      const words = spoken.split(/\s+/).slice(-6); // last 6 words
+      // Position is now driven by the Rust tracker via 'track-update' (below);
+      // this listener only powers the visualizer and the "hearing" status.
+    });
 
-      if(words.length < 2) return;
-
-      // Search forward from current position
-      const searchStart = Math.max(0, idx - 1);
-      const searchEnd = Math.min(items.length, idx + 12);
-      let bestIdx = -1;
-      let bestScore = 0;
-
-      for(let i=searchStart; i<searchEnd; i++){
-        if(items[i].kind!=='s') continue;
-        const sentText = items[i].text.toLowerCase().replace(/[^a-z0-9 ]/g,'');
-
-        let matches = 0;
-        for(const w of words){
-          if(w.length > 2 && sentText.includes(w)) matches++;
-        }
-        const score = words.length > 0 ? matches / words.length : 0;
-
-        if(score > bestScore && score > 0.3){
-          bestScore = score;
-          bestIdx = i;
-        }
-      }
-
-      // Only advance forward
-      if(bestIdx > idx){
-        idx = bestIdx;
+    // Drive the highlight from the canonical Rust tracker (replaces the old
+    // last-6-words JS matcher). Forward-only so a revised hypothesis cannot jump
+    // the cursor backward; the tracker already de-flickers partials.
+    trackUnlisten = await listen('track-update', (event)=>{
+      const u = event.payload;
+      if(state!=='run') return;
+      const itemIdx = mainSentenceItemIdx[u.sentence_index];
+      if(itemIdx === undefined) return;
+      if(itemIdx > idx){
+        idx = itemIdx;
         trackSection();
         highlight();
       }
@@ -396,6 +389,7 @@ async function startAppleSpeech(){
 
 function stopAppleSpeech(){
   if(speechUnlisten){speechUnlisten();speechUnlisten=null}
+  if(trackUnlisten){trackUnlisten();trackUnlisten=null}
   invoke('stop_speech').catch(()=>{});
   audioMode = false;
 }
