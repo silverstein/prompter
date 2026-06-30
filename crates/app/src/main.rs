@@ -1,12 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use prompter_core::script::{self, Directive, Element};
-use prompter_core::{ScriptTracker, SessionRecorder, SpeechUpdate, TrackState, TrackUpdate};
+use prompter_core::{
+    recent_words, ScriptTracker, SessionRecorder, SpeechUpdate, TrackState, TrackUpdate,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tauri::{Emitter, Manager};
 
 // ── Serializable types for the frontend ──
@@ -146,6 +149,10 @@ fn parse_script_text(text: String) -> Result<ScriptData, String> {
 struct TrackingSession {
     tracker: ScriptTracker,
     recorder: SessionRecorder,
+    /// Session start, for timestamping the ASR recording.
+    started: Instant,
+    /// Where the raw ASR stream is logged for offline replay (None if disabled).
+    recording: Option<std::path::PathBuf>,
 }
 
 #[derive(Default)]
@@ -198,17 +205,10 @@ fn track_event(u: &TrackUpdate) -> TrackEvent {
     }
 }
 
-/// The last `n` whitespace-separated words of `text`.
-///
-/// Apple's `SFSpeechRecognizer` streams the *cumulative* utterance (the whole
-/// thing, growing). The bigram-Dice aligner only matches ~1-3 sentences, so the
-/// full cumulative string stops matching a few sentences in and the cursor
-/// freezes. Feeding only the leading edge (recent words) keeps the match local,
-/// the way the prior JS matcher's "last 6 words" did.
-fn recent_words(text: &str, n: usize) -> String {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let start = words.len().saturating_sub(n);
-    words[start..].join(" ")
+/// Path of the rolling ASR recording (for offline replay/eval).
+fn recording_path() -> std::path::PathBuf {
+    let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".prompter").join("recording.jsonl")
 }
 
 /// Start a tracking session for `text` (the .script.md source).
@@ -220,12 +220,24 @@ fn init_tracking(state: tauri::State<TrackingState>, text: String) -> Result<(),
     *slot = None;
     let parsed = script::parse(&text).map_err(|e| format!("{}", e))?;
     let mut tracker = ScriptTracker::new(&parsed);
-    // Tight search window for live ASR following: keeps the match local so a
-    // spurious far match can't throw the cursor across the script.
-    tracker.set_window_radius(6);
+    // Window wide enough to recover when the cursor falls behind a few
+    // sentences; MAX_ADVANCE in the tracker caps any single forward jump. (Too
+    // tight a window froze the cursor once it fell outside it.)
+    tracker.set_window_radius(10);
+    // Start a fresh ASR recording for offline replay/eval.
+    let recording = {
+        let path = recording_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let header = serde_json::json!({ "type": "script", "source": text }).to_string();
+        fs::write(&path, format!("{header}\n")).ok().map(|_| path)
+    };
     *slot = Some(TrackingSession {
         tracker,
         recorder: SessionRecorder::new(&parsed),
+        started: Instant::now(),
+        recording,
     });
     Ok(())
 }
@@ -394,6 +406,22 @@ fn start_speech(app: tauri::AppHandle) -> Result<String, String> {
                             // dropping tracking (which would stall the scroll).
                             let mut guard = tstate.0.lock().unwrap_or_else(|p| p.into_inner());
                             guard.as_mut().map(|s| {
+                                // Log the raw ASR event for offline replay/eval.
+                                if let Some(path) = &s.recording {
+                                    let line = serde_json::json!({
+                                        "type": "asr",
+                                        "t": s.started.elapsed().as_millis() as u64,
+                                        "text": text,
+                                        "final": is_final,
+                                    })
+                                    .to_string();
+                                    use std::io::Write;
+                                    if let Ok(mut f) =
+                                        fs::OpenOptions::new().append(true).open(path)
+                                    {
+                                        let _ = writeln!(f, "{line}");
+                                    }
+                                }
                                 // Align on the leading edge (recent words), but
                                 // record the full recognized text in the transcript.
                                 let update = s.tracker.observe(&SpeechUpdate {

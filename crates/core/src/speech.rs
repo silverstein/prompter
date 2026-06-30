@@ -9,6 +9,19 @@
 
 use std::collections::VecDeque;
 
+/// The last `n` whitespace-separated words of `text`.
+///
+/// Cumulative streaming recognizers (Apple `SFSpeechRecognizer`) emit the whole
+/// growing utterance; the windowed aligner only matches ~1-3 sentences, so the
+/// full string stops matching a few sentences in. Feeding only the leading edge
+/// keeps the match local. Shared by the app's live feed and the offline replay
+/// harness so both behave identically.
+pub fn recent_words(text: &str, n: usize) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let start = words.len().saturating_sub(n);
+    words[start..].join(" ")
+}
+
 /// A single recognized word with optional timing/confidence, when the provider
 /// supplies them. `start_ms` / `end_ms` are offsets from session start.
 ///

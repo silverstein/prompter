@@ -30,3 +30,4 @@ sherpa-onnx = { version = "1.13", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1"
+serde_json = "1"
