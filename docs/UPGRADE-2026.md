@@ -181,6 +181,34 @@ for `isFinal` to scroll. Model choice is the latency budget; alignment compute i
   (~15 sentences) of where the branch left off, which holds for the short guidance branches the
   DSL targets.
 
+### Partials-only provider (Apple SFSpeechRecognizer): fixed + remaining follow-ups
+
+Apple's recognizer emits only cumulative volatile PARTIALS during continuous reading and rarely a
+final until a long pause (a real 36s read produced 113 partials, 0 finals). The tracker/recorder
+originally assumed finals arrive regularly. Fixed (see `examples/replay` + tests):
+
+- **Cursor freeze** — partials were capped at `committed + MAX_ADVANCE` and the engine window was
+  centered on the committed cursor; both only moved on finals, so the cursor froze near the start.
+  Now partials rate-limit from the live cursor and slide the window; the freeze is gone.
+- **Empty compliance report** — the recorder gated all evidence on `committed`; matched partials now
+  count coverage / pauses / transcript (deduped), so a continuous read produces a real report.
+- **Branch-resume freeze** — `InBranch` ignored partials, so resuming the main script without a
+  final pinned the cursor in the branch. Partials now detect the `post_main` return.
+
+Deferred follow-ups (do NOT bite a normal linear read; tracked, not fixed):
+
+- **Branch SELECTION still needs a final** — picking a branch option only happens on `observe_final`.
+  Branches are Q&A points where the speaker stops (a final fires), and skipping the branch on the
+  main line still tracks via partials, so this is a recording gap (`branches_taken` may be empty if
+  no final lands at the branch), not a freeze.
+- **Ad-lib detection is final-only** — `peek` does not feed the miss counter, so sustained off-script
+  speech during a no-finals stretch won't surface `AdLibbing`.
+- **An unmatched final can cement a slid preview** into `committed` (the recorder is unaffected:
+  `matched=false` carries no coverage). Bounded by `MAX_ADVANCE` per step.
+- **Pause/branch cue position** — partials surface the pause/branch *state*, but `sentence_index`
+  still points at the preceding sentence; the speech-mode UI currently highlights by sentence index
+  and does not render the cue, so pauses/branches are not yet shown live during a spoken read.
+
 ## 7. References (selected, from the 2026 SOTA research)
 
 - Open ASR Leaderboard: arXiv 2510.06961. Whisper is batch-by-construction: gladia.io/blog/what-is-openai-whisper.

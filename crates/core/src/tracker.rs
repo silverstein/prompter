@@ -365,7 +365,21 @@ impl ScriptTracker {
     }
 
     fn observe_partial(&mut self, text: &str) -> TrackUpdate {
-        if matches!(self.mode, Mode::InBranch { .. }) {
+        if let Mode::InBranch { branch, .. } = self.mode {
+            // Detect the return to the main line from a partial. Without this,
+            // a partials-only provider leaves the cursor pinned in the branch
+            // forever once the speaker resumes the script (the same freeze class
+            // as the linear path -- finals may never arrive). `post_main` is a
+            // specific sentence gated by the match threshold, so promoting this
+            // transition on a confident partial is safe.
+            if let Some(pm) = self.branches[branch].post_main {
+                if align::similarity(text, &self.main_sentences[pm]) >= align::MATCH_THRESHOLD {
+                    self.engine.set_position(pm);
+                    self.commit_linear();
+                    return self.committed_update(true, None);
+                }
+            }
+            // Still on the branch option: no main-line preview to offer.
             return TrackUpdate {
                 sentence_index: self.committed,
                 timeline_index: self.committed_timeline,
@@ -387,7 +401,7 @@ impl ScriptTracker {
             // continuous reading `committed` never advances. A committed-anchored
             // cap froze the cursor permanently at committed + MAX_ADVANCE (the
             // "prompter never budges" bug). See tracker tests + examples/replay.
-            let capped = result.position.min(self.preview + MAX_ADVANCE);
+            let capped = result.position.min(self.preview.saturating_add(MAX_ADVANCE));
             if capped > self.preview {
                 self.preview = capped;
                 // Slide the engine's search window forward to follow the reader.
@@ -713,6 +727,28 @@ mod tests {
         ));
         assert!(back.branch_choice.is_none());
         assert_eq!(back.state, TrackState::Speaking);
+        assert_eq!(t.position(), 3);
+    }
+
+    #[test]
+    fn returns_to_main_from_branch_on_a_partial() {
+        // Branch selection happens on finals (the speaker stops to ask, so a
+        // final fires there), but the speaker then resumes the main script
+        // CONTINUOUSLY -- partials only, no final. The cursor must leave the
+        // branch on a confident partial instead of pinning forever (the same
+        // freeze class as the linear path). Regression for codex P1#2.
+        let mut t = ScriptTracker::new(&sample_script());
+        t.observe(&SpeechUpdate::finalized(
+            "you are currently taking warfarin and metformin",
+        ));
+        let pick = t.observe(&SpeechUpdate::finalized(
+            "okay then lets keep moving along nicely",
+        ));
+        assert!(matches!(pick.state, TrackState::InBranch { .. }));
+
+        // Resume the main line on a PARTIAL (post-branch sentence).
+        let back = t.observe(&SpeechUpdate::partial("does this make sense so far for you"));
+        assert_eq!(back.state, TrackState::Speaking, "left the branch on a partial");
         assert_eq!(t.position(), 3);
     }
 
