@@ -201,13 +201,24 @@ fn track_event(u: &TrackUpdate) -> TrackEvent {
 /// Start a tracking session for `text` (the .script.md source).
 #[tauri::command]
 fn init_tracking(state: tauri::State<TrackingState>, text: String) -> Result<(), String> {
+    let mut slot = state.0.lock().map_err(|_| "tracking state poisoned")?;
+    // Clear any prior session FIRST: a failed init (or a new session) must not
+    // leave a stale tracker that later speech could feed into.
+    *slot = None;
     let parsed = script::parse(&text).map_err(|e| format!("{}", e))?;
-    let session = TrackingSession {
+    *slot = Some(TrackingSession {
         tracker: ScriptTracker::new(&parsed),
         recorder: SessionRecorder::new(&parsed),
-    };
-    *state.0.lock().map_err(|_| "tracking state poisoned")? = Some(session);
+    });
     Ok(())
+}
+
+/// Clear the tracking session (e.g. on reset), so a stale tracker cannot mis-track.
+#[tauri::command]
+fn clear_tracking(state: tauri::State<TrackingState>) {
+    if let Ok(mut slot) = state.0.lock() {
+        *slot = None;
+    }
 }
 
 /// Speech-verified compliance report returned to the frontend at session end.
@@ -234,13 +245,19 @@ struct ComplianceOut {
 fn finish_tracking(
     state: tauri::State<TrackingState>,
     duration_secs: u64,
+    section_times: HashMap<String, u64>,
 ) -> Result<ComplianceOut, String> {
-    let guard = state.0.lock().map_err(|_| "tracking state poisoned")?;
-    let session = guard
-        .as_ref()
-        .ok_or("no active tracking session (call init_tracking first)")?;
+    // Take (and clear) the session, then release the lock before disk I/O so the
+    // speech reader is never blocked and a stale session can't leak forward.
+    let session = {
+        let mut slot = state.0.lock().map_err(|_| "tracking state poisoned")?;
+        slot.take()
+    }
+    .ok_or("no active tracking session (call init_tracking first)")?;
 
-    let report = session.recorder.build_report(duration_secs);
+    let mut report = session.recorder.build_report(duration_secs);
+    // The recorder has no clock; the UI supplies per-section timing.
+    report.section_times = section_times;
     let transcript = session.recorder.transcript_markdown();
 
     let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -356,9 +373,10 @@ fn start_speech(app: tauri::AppHandle) -> Result<String, String> {
                         // the emit, to avoid holding it across the borrow.
                         let track = {
                             let tstate = app.state::<TrackingState>();
-                            let mut guard = tstate.0.lock().ok();
-                            let session = guard.as_mut().and_then(|g| g.as_mut());
-                            session.map(|s| {
+                            // Recover a poisoned lock rather than silently
+                            // dropping tracking (which would stall the scroll).
+                            let mut guard = tstate.0.lock().unwrap_or_else(|p| p.into_inner());
+                            guard.as_mut().map(|s| {
                                 let update = s.tracker.observe(&SpeechUpdate {
                                     text: text.to_string(),
                                     words: Vec::new(),
@@ -726,6 +744,7 @@ fn main() {
             load_script,
             parse_script_text,
             init_tracking,
+            clear_tracking,
             finish_tracking,
             start_speech,
             stop_speech,

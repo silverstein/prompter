@@ -284,20 +284,25 @@ async function startSession(){
   hide('startBar'); show('status');
 
   // Build the canonical Rust tracker for this session (speech-verified coverage
-  // + compliance). Best-effort: if it fails, the live scroll still works and we
-  // fall back to the cursor-derived report at endSession.
+  // + compliance). The track-update events it produces drive the highlight.
+  let trackingOk = false;
   if(script && script.source){
-    await invoke('init_tracking', {text: script.source}).catch(()=>{});
+    trackingOk = await invoke('init_tracking', {text: script.source}).then(()=>true).catch(()=>false);
   }
-
-  // Start Apple Speech recognition for real-time tracking
-  startAppleSpeech();
+  if(trackingOk){
+    startAppleSpeech();   // speech + track-update drive the scroll
+  } else {
+    // No tracker (parse failed / no source): fall back to timer auto-scroll so
+    // the teleprompter still advances instead of sitting stuck.
+    startScroll();
+  }
 
   updateSt(); startClock();
 }
 function resetAll(){
   stopScroll(); stopClock(); stopAppleSpeech();
-  script=null; items=[]; idx=0; state='idle';
+  invoke('clear_tracking').catch(()=>{});
+  script=null; items=[]; idx=0; mainSentenceItemIdx=[]; state='idle';
   hide('nav'); hide('tp'); hide('startBar'); hide('status'); hide('doneOverlay');
   show('empty');
 }
@@ -487,7 +492,10 @@ function endSession(){
   }
   // Prefer the speech-verified report from the Rust tracker; fall back to the
   // cursor-derived JS report if tracking was not initialized this session.
-  invoke('finish_tracking', { durationSecs: elapsed }).then(rep => {
+  // Brief delay first so any in-flight recognized line is fed to the tracker
+  // before we build the report (stop_speech flips a flag; it does not join).
+  setTimeout(()=>{
+  invoke('finish_tracking', { durationSecs: elapsed, sectionTimes: sectionTimesMap }).then(rep => {
     showSavedPath(rep.saved_path);
     invoke('get_coaching', { report: {
       script_title: rep.script_title,
@@ -506,6 +514,7 @@ function endSession(){
     invoke('save_compliance', { report: jsReport }).then(showSavedPath).catch(e=>{showErr('Compliance report not saved: '+e)});
     invoke('get_coaching', { report: jsReport }).then(renderCoaching).catch(e=>{console.warn('coaching:',e)});
   });
+  }, 120);
 
   // Coaching renderer (used by both the speech-verified and fallback paths).
   function renderCoaching(insights){
