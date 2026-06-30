@@ -12,7 +12,7 @@
 //! Defaults: ~/.prompter/recording.jsonl, window 10, tail 10. Sweep `window`
 //! against the SAME recording to compare settings.
 
-use prompter_core::{recent_words, script, ScriptTracker, SpeechUpdate};
+use prompter_core::{recent_words, script, ScriptTracker, SessionRecorder, SpeechUpdate};
 use std::io::BufRead;
 
 fn main() {
@@ -31,6 +31,7 @@ fn main() {
     let reader = std::io::BufReader::new(file);
 
     let mut tracker: Option<ScriptTracker> = None;
+    let mut recorder: Option<SessionRecorder> = None;
     let mut total = 0usize;
     let mut last = 0usize;
     let mut events = 0usize;
@@ -61,6 +62,7 @@ fn main() {
                 let mut t = ScriptTracker::new(&parsed);
                 t.set_window_radius(window);
                 total = t.sentence_count();
+                recorder = Some(SessionRecorder::new(&parsed));
                 println!(
                     "# {total} main sentences | window={window} tail={tail}\n# {:>8} {} {:>4} {:>5}  {:<9} tail",
                     "t(ms)", "F", "idx", "d", "state"
@@ -80,6 +82,9 @@ fn main() {
                     words: Vec::new(),
                     is_final,
                 });
+                if let Some(rec) = recorder.as_mut() {
+                    rec.record(&u, &lead);
+                }
                 let delta = u.sentence_index as i64 - last as i64;
                 if u.sentence_index == last {
                     freeze_run += 1;
@@ -116,4 +121,24 @@ fn main() {
         "\n# {events} events | reached idx {max_idx}/{} ({pct:.0}%) | longest freeze {max_freeze} events | max single jump +{max_jump}",
         total.saturating_sub(1)
     );
+
+    // Speech-verified compliance, built from the SAME stream the app records.
+    // Proves the recorder produces a real report from partials-only input.
+    if let Some(rec) = recorder.as_ref() {
+        let report = rec.build_report(0);
+        let words_pct = if report.total_words > 0 {
+            100.0 * report.words_delivered as f64 / report.total_words as f64
+        } else {
+            0.0
+        };
+        println!(
+            "# recorder: {}/{} words delivered ({words_pct:.0}%) | pauses {}/{} | transcript {} lines | branches {}",
+            report.words_delivered,
+            report.total_words,
+            report.pause_points_reached,
+            report.pause_points_total,
+            rec.transcript().len(),
+            report.branches_taken.len(),
+        );
+    }
 }

@@ -422,14 +422,19 @@ fn start_speech(app: tauri::AppHandle) -> Result<String, String> {
                                         let _ = writeln!(f, "{line}");
                                     }
                                 }
-                                // Align on the leading edge (recent words), but
-                                // record the full recognized text in the transcript.
+                                // Align on and record the leading edge (recent
+                                // words). The recognizer streams the whole growing
+                                // cumulative utterance, so recording the raw `text`
+                                // would write the entire script-so-far into every
+                                // transcript line; the leading edge is the words
+                                // actually just spoken for this sentence.
+                                let lead = recent_words(text, 10);
                                 let update = s.tracker.observe(&SpeechUpdate {
-                                    text: recent_words(text, 10),
+                                    text: lead.clone(),
                                     words: Vec::new(),
                                     is_final,
                                 });
-                                s.recorder.record(&update, text);
+                                s.recorder.record(&update, &lead);
                                 track_event(&update)
                             })
                         };

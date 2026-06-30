@@ -44,6 +44,9 @@ pub struct SessionRecorder {
     /// Branch question -> chosen option label.
     branches_taken: HashMap<String, String>,
     transcript: Vec<TranscriptLine>,
+    /// Highest main sentence already written to the transcript, so partial
+    /// evidence adds one line per sentence reached instead of one per partial.
+    last_transcript_sentence: Option<usize>,
 }
 
 impl SessionRecorder {
@@ -103,19 +106,26 @@ impl SessionRecorder {
             pauses_reached: HashSet::new(),
             branches_taken: HashMap::new(),
             transcript: Vec::new(),
+            last_transcript_sentence: None,
         }
     }
 
-    /// Record one committed update and the text that produced it. Partial
-    /// (preview) updates carry no evidence and are ignored.
+    /// Record one update and the text that produced it.
+    ///
+    /// Evidence may come from a committed final OR a confident partial: Apple's
+    /// recognizer only finalizes at long pauses, so during continuous reading
+    /// matched partials are the ONLY delivery evidence the recorder ever sees.
+    /// Gating on `committed` alone left the compliance report empty for an
+    /// entire read. Unmatched, non-committed updates still carry nothing.
     pub fn record(&mut self, update: &TrackUpdate, recognized: &str) {
-        if !update.committed {
+        if !update.matched && !update.committed {
             return;
         }
 
-        // Coverage / pause evidence counts ONLY on a real match. An unmatched
-        // committed final (off-script speech, a short utterance) must not mark a
-        // sentence delivered -- that was the over-count the cursor-based path had.
+        // Coverage / pause evidence counts ONLY on a real match (partial or
+        // final). An unmatched committed final (off-script speech, a short
+        // utterance) must not mark a sentence delivered -- that was the
+        // over-count the cursor-based path had.
         if update.matched {
             match &update.state {
                 // InBranch carries the pre-branch sentence index: reaching a
@@ -148,16 +158,29 @@ impl SessionRecorder {
                 .insert(choice.question.clone(), choice.option_label.clone());
         }
 
-        // The transcript records every committed final (including off-script
-        // speech) for a complete record; coverage above is what is gated.
-        self.transcript.push(TranscriptLine {
-            sentence_index: update.sentence_index,
-            recognized: recognized.to_string(),
-            branch_option: update
-                .branch_choice
-                .as_ref()
-                .map(|c| c.option_label.clone()),
-        });
+        // Transcript: one authoritative line per committed final (including
+        // off-script speech, for a complete record) and one line per NEW
+        // sentence reached on partials (deduped by forward advance, so a stream
+        // of volatile partials on the same sentence doesn't spam the transcript).
+        let advanced = match self.last_transcript_sentence {
+            Some(prev) => update.sentence_index > prev,
+            None => true,
+        };
+        if update.committed || update.branch_choice.is_some() || (update.matched && advanced) {
+            self.transcript.push(TranscriptLine {
+                sentence_index: update.sentence_index,
+                recognized: recognized.to_string(),
+                branch_option: update
+                    .branch_choice
+                    .as_ref()
+                    .map(|c| c.option_label.clone()),
+            });
+            self.last_transcript_sentence = Some(
+                update
+                    .sentence_index
+                    .max(self.last_transcript_sentence.unwrap_or(0)),
+            );
+        }
     }
 
     /// Words with committed evidence of delivery.
@@ -366,15 +389,49 @@ mod tests {
     }
 
     #[test]
-    fn partials_carry_no_evidence() {
+    fn unmatched_partial_carries_no_evidence() {
+        // Off-script partial that does not align: no coverage, no transcript.
         let script = sample_script();
         let mut tracker = ScriptTracker::new(&script);
         let mut rec = SessionRecorder::new(&script);
         let u = tracker.observe(&SpeechUpdate::partial(
-            "hi thanks for meeting with me today",
+            "kubernetes pod autoscaling webpack bundle configuration",
         ));
-        rec.record(&u, "hi thanks for meeting with me today");
+        rec.record(&u, "kubernetes pod autoscaling webpack bundle configuration");
         assert_eq!(rec.build_report(5).words_delivered, 0);
         assert!(rec.transcript().is_empty());
+    }
+
+    #[test]
+    fn matched_partial_is_evidence() {
+        // A confident partial IS delivery evidence: with a partials-only
+        // provider (no finals during continuous reading) this is the only
+        // signal the compliance report can be built from. Regression for the
+        // "report shows 0 words delivered after reading the whole script" bug.
+        let script = sample_script();
+        let mut tracker = ScriptTracker::new(&script);
+        let mut rec = SessionRecorder::new(&script);
+        let text = "hi thanks for meeting with me today";
+        let u = tracker.observe(&SpeechUpdate::partial(text));
+        assert!(u.matched && !u.committed, "matched partial, not committed");
+        rec.record(&u, text);
+        // Sentence 0 (7 words) is now credited from the partial alone.
+        assert_eq!(rec.build_report(5).words_delivered, 7);
+        assert_eq!(rec.transcript().len(), 1);
+    }
+
+    #[test]
+    fn repeated_partials_on_one_sentence_dont_spam_transcript() {
+        // Cumulative partials re-emit the same leading edge many times; the
+        // transcript must add at most one line per sentence reached.
+        let script = sample_script();
+        let mut tracker = ScriptTracker::new(&script);
+        let mut rec = SessionRecorder::new(&script);
+        let text = "hi thanks for meeting with me today";
+        for _ in 0..5 {
+            let u = tracker.observe(&SpeechUpdate::partial(text));
+            rec.record(&u, text);
+        }
+        assert_eq!(rec.transcript().len(), 1);
     }
 }

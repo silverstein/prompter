@@ -406,9 +406,18 @@ impl ScriptTracker {
             sentence_index: self.preview,
             timeline_index,
             committed: false,
-            matched: false,
+            // Surface the peek's match result: a confident partial IS evidence
+            // the sentence was spoken. With a partials-only provider this is the
+            // ONLY evidence the recorder ever gets (finals never arrive during
+            // continuous reading), so gating coverage on `committed` alone left
+            // the compliance report empty. `committed` stays false (volatile),
+            // so the recorder still distinguishes preview from confirmed.
+            matched: result.matched,
             confidence: result.confidence,
-            state: self.committed_state.clone(),
+            // Derive the pause/branch cue from the live cursor so the operator
+            // sees "wait for response" / the branch question as they reach it,
+            // not only after a final lands (which may never happen). Pure lookup.
+            state: self.linear_state_at(self.preview),
             branch_choice: None,
         }
     }
