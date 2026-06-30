@@ -483,8 +483,14 @@ struct Settings {
     speed: u32,
     #[serde(default)]
     always_on_top: bool,
+    #[serde(default = "default_highlight_mode")]
+    highlight_mode: String,
     #[serde(default)]
     recent_scripts: Vec<RecentScript>,
+}
+
+fn default_highlight_mode() -> String {
+    "soft".to_string()
 }
 
 fn default_font_size() -> u32 {

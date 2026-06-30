@@ -53,7 +53,12 @@
   .nav button.done{color:var(--green);opacity:.45}
 
   /* ── Teleprompter ── */
-  .tp{flex:1;overflow-y:auto;padding:48px 48px 240px;scroll-behavior:smooth;scrollbar-width:none;display:none}
+  /* scroll-behavior:auto -- the JS rAF lerp provides smoothness; CSS smooth
+     would fight it. mask fades text in/out at the edges so the eye settles in
+     the reading zone (the SOTA voice-teleprompter look). */
+  .tp{flex:1;overflow-y:auto;padding:48px 48px 240px;scroll-behavior:auto;scrollbar-width:none;display:none;
+    -webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 15%,#000 72%,transparent 100%);
+    mask-image:linear-gradient(to bottom,transparent 0,#000 15%,#000 72%,transparent 100%)}
   .tp.show{display:block}
   .tp::-webkit-scrollbar{display:none}
 
@@ -71,22 +76,28 @@
 
   .text-block{margin-bottom:1.4em}
 
+  /* Read-along, not karaoke: a soft brightness gradient (read = dim, current =
+     bright, upcoming = readable). No box, no snap. Default mode = soft-dim. */
   .s{
     font-size:var(--font-size);line-height:var(--line-height);display:inline;
-    transition:all .25s ease;color:#52525b;
-    padding:3px 1px;border-radius:4px;
+    transition:color .3s ease,opacity .3s ease;color:#9ca3af;
+    padding:2px 1px;
     -webkit-box-decoration-break:clone;box-decoration-break:clone
   }
-  .s.past{color:#333}
-  .s.cur{
-    color:#ffffff !important;
-    background:#166534 !important;
-    padding:4px 8px !important;
-    border-radius:6px !important;
-    border-left:4px solid #22c55e !important;
-    box-shadow:0 0 24px rgba(34,197,94,0.3) !important
-  }
-  .s.up{color:#71717a}
+  .s.up{color:#9ca3af}
+  .s.cur{color:#ffffff}
+  .s.past{color:#52525b;opacity:.5}
+
+  /* dial (highlight_mode setting): glow adds a soft halo to the current line,
+     off removes all emphasis (pure eased scroll). soft is the base above. */
+  .tp[data-hl="glow"] .s.cur{color:#fff;text-shadow:0 0 18px rgba(34,197,94,.5)}
+  .tp[data-hl="off"] .s.cur{color:#d4d4d8}
+  .tp[data-hl="off"] .s.past{color:#a1a1aa;opacity:1}
+
+  /* Fixed reading line: a faint anchor at ~38% so the eye has a home. */
+  .readline{position:fixed;left:0;right:0;top:38%;height:0;pointer-events:none;
+    z-index:5;border-top:1px solid rgba(34,197,94,0.10);display:none}
+  .readline.show{display:block}
 
   .pause{
     display:flex;align-items:center;gap:10px;margin:1.4em 0;padding:14px 18px;

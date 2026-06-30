@@ -25,6 +25,7 @@
 </div>
 
 <div class="tp" id="tp"></div>
+<div class="readline" id="readline"></div>
 
 <div class="start-bar" id="startBar">
   <button class="btn-primary" id="btnStart">Start Session</button>
@@ -117,6 +118,13 @@ let idx = 0;
 let state = 'idle';      // idle | loaded | run | pause | wait | done
 let speed = 150;
 let fontSize = 34;
+let hlMode = 'soft';   // 'soft' | 'glow' | 'off'  (press H to cycle)
+function cycleHl(){
+  hlMode = hlMode==='soft' ? 'glow' : hlMode==='glow' ? 'off' : 'soft';
+  if(els.tp) els.tp.dataset.hl = hlMode;
+  if(els.stCurText) els.stCurText.textContent = 'highlight: '+hlMode;
+  persistSettings();
+}
 let timer = null;
 let clockId = null;
 let t0 = null;
@@ -290,17 +298,20 @@ async function startSession(){
     trackingOk = await invoke('init_tracking', {text: script.source}).then(()=>true).catch(()=>false);
   }
   if(trackingOk){
-    startAppleSpeech();   // speech + track-update drive the scroll
+    startAppleSpeech();   // speech + track-update drive the cursor
   } else {
     // No tracker (parse failed / no source): fall back to timer auto-scroll so
     // the teleprompter still advances instead of sitting stuck.
     startScroll();
   }
 
+  startFollow();                                   // eased scroll follows the cursor
+  document.getElementById('readline').classList.add('show');
   updateSt(); startClock();
 }
 function resetAll(){
-  stopScroll(); stopClock(); stopAppleSpeech();
+  stopScroll(); stopClock(); stopAppleSpeech(); stopFollow();
+  document.getElementById('readline').classList.remove('show');
   invoke('clear_tracking').catch(()=>{});
   script=null; items=[]; idx=0; mainSentenceItemIdx=[]; state='idle';
   hide('nav'); hide('tp'); hide('startBar'); hide('status'); hide('doneOverlay');
@@ -418,7 +429,8 @@ function toggle(){
 
 // ── End session ──
 function endSession(){
-  state='done'; stopScroll(); stopClock(); stopAppleSpeech(); updateSt();
+  state='done'; stopScroll(); stopClock(); stopAppleSpeech(); stopFollow();
+  document.getElementById('readline').classList.remove('show'); updateSt();
   const elapsed = t0 ? Math.floor((Date.now()-t0)/1000) : 0;
   const card = els.doneCard;
   while(card.firstChild) card.removeChild(card.firstChild);
@@ -658,6 +670,8 @@ function buildTP(){
 
 // ── Highlight ──
 function highlight(){
+  // Soft-dim read-along: classes set the brightness; the eased-scroll rAF loop
+  // (scrollFollow) does the scrolling so the view glides and never snaps.
   document.querySelectorAll('.s[data-i]').forEach(el=>{
     const i=+el.dataset.i;
     el.classList.remove('past','cur','up');
@@ -665,20 +679,6 @@ function highlight(){
     else if(i===idx) el.classList.add('cur');
     else el.classList.add('up');
   });
-  // Smooth scroll: keep the CURRENT element (sentence or pause) pinned ~40% from
-  // the top so your eye line stays in one place. One mechanism for both, so the
-  // view never yanks to re-center a pause, and it follows the cursor line-by-line.
-  const cur=document.querySelector('[data-i="'+idx+'"]');
-  if(cur){
-    const tp=els.tp;
-    const tpRect=tp.getBoundingClientRect();
-    const curRect=cur.getBoundingClientRect();
-    const targetY=tpRect.top + tpRect.height * 0.40;
-    const offset=curRect.top - targetY;
-    if(Math.abs(offset) > 10){
-      tp.scrollBy({top:offset, behavior:'smooth'});
-    }
-  }
 
   document.querySelectorAll('.pause[data-i]').forEach(el=>{
     const i=+el.dataset.i;
@@ -690,6 +690,29 @@ function highlight(){
 
   updateNav(); updateProgress();
 }
+
+// ── Eased follow scroll ──
+// A continuous rAF lerp glides the page so the CURRENT line sits ~38% from the
+// top. Because it eases toward a moving target every frame, it never jumps -- a
+// big cursor correction just glides faster, and a frozen cursor just holds.
+let scrollRAF = null;
+function scrollFollow(){
+  if(state==='idle'||state==='done'){ scrollRAF=null; return; }
+  const cur=document.querySelector('[data-i="'+idx+'"]');
+  if(cur){
+    const tp=els.tp;
+    const tpRect=tp.getBoundingClientRect();
+    const curRect=cur.getBoundingClientRect();
+    const targetY=tpRect.top + tpRect.height*0.38;
+    const delta=curRect.top - targetY;          // current line vs the read-line
+    if(Math.abs(delta) > 0.5){
+      tp.scrollTop += delta * 0.14;             // ease ~14% of the gap per frame
+    }
+  }
+  scrollRAF=requestAnimationFrame(scrollFollow);
+}
+function startFollow(){ if(scrollRAF===null) scrollRAF=requestAnimationFrame(scrollFollow); }
+function stopFollow(){ if(scrollRAF!==null){cancelAnimationFrame(scrollRAF);scrollRAF=null;} }
 
 function updateNav(){
   if(!items.length)return;
@@ -772,6 +795,8 @@ async function restoreSettings(){
       speed=s.speed; els.speedSlider.value=speed; els.speedVal.textContent=speed+' wpm';
     }
     if(s.always_on_top){ pinned=true; els.pinBtn.classList.add('on'); }
+    hlMode = s.highlight_mode || 'soft';
+    if(els.tp) els.tp.dataset.hl = hlMode;
   }catch(e){}
 }
 
@@ -782,6 +807,7 @@ async function persistSettings(){
     current.font_size = fontSize;
     current.speed = speed;
     current.always_on_top = pinned;
+    current.highlight_mode = hlMode;
     await invoke('save_settings', { settings: current });
   }catch(e){}
 }
@@ -867,6 +893,7 @@ document.addEventListener('keydown', e=>{
     case '+':case '=':setFont(2);break;
     case '-':case '_':setFont(-2);break;
     case 'h':case 'H':toggleHelp();break;
+    case 'm':case 'M':cycleHl();break;
     case 'Tab':
       e.preventDefault();
       const bc=document.querySelector('.branch');
