@@ -517,6 +517,10 @@ struct Settings {
     always_on_top: bool,
     #[serde(default = "default_highlight_mode")]
     highlight_mode: String,
+    /// Hide the window from screenshots / screen-share / screen-recording
+    /// (macOS content protection). `None` = use the conf default (protected).
+    #[serde(default)]
+    hide_from_screen_share: Option<bool>,
     #[serde(default)]
     recent_scripts: Vec<RecentScript>,
 }
@@ -757,17 +761,12 @@ fn urlencoding_decode(s: &str) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// Bring the main window to the front (from the tray "Show Prompter" item).
-fn show_main_window(app: &tauri::AppHandle) {
-    // On macOS, Cmd-H / hide hides the whole app; unhide it first.
-    #[cfg(target_os = "macos")]
-    {
-        let _ = app.show();
-    }
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.show();
-        let _ = win.unminimize();
-        let _ = win.set_focus();
+/// Label for the screen-share toggle, with a check when protection is on.
+fn screen_share_label(hidden: bool) -> &'static str {
+    if hidden {
+        "Hide from Screen Share ✓"
+    } else {
+        "Hide from Screen Share"
     }
 }
 
@@ -779,24 +778,53 @@ fn main() {
         .setup(|app| {
             use tauri::Listener;
 
-            // Menu-bar tray so the app can be brought back after Cmd-H / hide.
+            // Menu-bar tray with the screen-share visibility toggle. The window
+            // is content-protected (hidden from screenshots / screen-share /
+            // recording) by default; this lets the operator reveal it on demand
+            // and persists the choice. Mirrors the minutes "Hide from Screen
+            // Share" tray item.
             {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                use std::sync::Arc;
                 use tauri::menu::{Menu, MenuItem};
                 use tauri::tray::TrayIconBuilder;
-                let show =
-                    MenuItem::with_id(app, "tray_show", "Show Prompter", true, None::<&str>)?;
-                let hide = MenuItem::with_id(app, "tray_hide", "Hide", true, None::<&str>)?;
+
+                // Saved choice; None means "use the conf default" (protected).
+                let hidden = load_settings().hide_from_screen_share.unwrap_or(true);
+                // Re-apply the saved choice to the live window (conf seeds it
+                // true, so this only matters when the operator chose to reveal).
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.set_content_protected(hidden);
+                }
+
+                let screen_item = MenuItem::with_id(
+                    app,
+                    "screen-share-toggle",
+                    screen_share_label(hidden),
+                    true,
+                    None::<&str>,
+                )?;
                 let quit =
                     MenuItem::with_id(app, "tray_quit", "Quit Prompter", true, None::<&str>)?;
-                let menu = Menu::with_items(app, &[&show, &hide, &quit])?;
+                let menu = Menu::with_items(app, &[&screen_item, &quit])?;
+
+                let state = Arc::new(AtomicBool::new(hidden));
+                let state_cl = state.clone();
+                let item_cl = screen_item.clone();
+
                 let mut tray = TrayIconBuilder::with_id("prompter-tray")
                     .menu(&menu)
-                    .on_menu_event(|app, event| match event.id().as_ref() {
-                        "tray_show" => show_main_window(app),
-                        "tray_hide" => {
-                            if let Some(win) = app.get_webview_window("main") {
-                                let _ = win.hide();
+                    .on_menu_event(move |app, event| match event.id().as_ref() {
+                        "screen-share-toggle" => {
+                            let new_state = !state_cl.load(Ordering::Relaxed);
+                            state_cl.store(new_state, Ordering::Relaxed);
+                            let _ = item_cl.set_text(screen_share_label(new_state));
+                            for (_, win) in app.webview_windows() {
+                                let _ = win.set_content_protected(new_state);
                             }
+                            let mut s = load_settings();
+                            s.hide_from_screen_share = Some(new_state);
+                            let _ = save_settings(s);
                         }
                         "tray_quit" => app.exit(0),
                         _ => {}
