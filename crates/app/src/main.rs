@@ -757,6 +757,20 @@ fn urlencoding_decode(s: &str) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Bring the main window to the front (from the tray "Show Prompter" item).
+fn show_main_window(app: &tauri::AppHandle) {
+    // On macOS, Cmd-H / hide hides the whole app; unhide it first.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.show();
+    }
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -764,6 +778,34 @@ fn main() {
         .manage(TrackingState::default())
         .setup(|app| {
             use tauri::Listener;
+
+            // Menu-bar tray so the app can be brought back after Cmd-H / hide.
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::TrayIconBuilder;
+                let show =
+                    MenuItem::with_id(app, "tray_show", "Show Prompter", true, None::<&str>)?;
+                let hide = MenuItem::with_id(app, "tray_hide", "Hide", true, None::<&str>)?;
+                let quit =
+                    MenuItem::with_id(app, "tray_quit", "Quit Prompter", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&show, &hide, &quit])?;
+                let mut tray = TrayIconBuilder::with_id("prompter-tray")
+                    .menu(&menu)
+                    .on_menu_event(|app, event| match event.id().as_ref() {
+                        "tray_show" => show_main_window(app),
+                        "tray_hide" => {
+                            if let Some(win) = app.get_webview_window("main") {
+                                let _ = win.hide();
+                            }
+                        }
+                        "tray_quit" => app.exit(0),
+                        _ => {}
+                    });
+                if let Some(icon) = app.default_window_icon() {
+                    tray = tray.icon(icon.clone());
+                }
+                let _ = tray.build(app);
+            }
             // Handle deep links (prompter://open?file=... or prompter://open?consultation_id=...)
             let handle = app.handle().clone();
             app.handle().listen("deep-link://new-url", move |event| {
