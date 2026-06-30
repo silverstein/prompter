@@ -95,7 +95,7 @@
   .tp[data-hl="off"] .s.past{color:#a1a1aa;opacity:1}
 
   /* Fixed reading line: a faint anchor at ~38% so the eye has a home. */
-  .readline{position:fixed;left:0;right:0;top:38%;height:0;pointer-events:none;
+  .readline{position:fixed;left:0;right:0;top:32%;height:0;pointer-events:none;
     z-index:5;border-top:1px solid rgba(34,197,94,0.10);display:none}
   .readline.show{display:block}
 

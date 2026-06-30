@@ -703,7 +703,7 @@ function scrollFollow(){
     const tp=els.tp;
     const tpRect=tp.getBoundingClientRect();
     const curRect=cur.getBoundingClientRect();
-    const targetY=tpRect.top + tpRect.height*0.38;
+    const targetY=tpRect.top + tpRect.height*0.32;
     const delta=curRect.top - targetY;          // current line vs the read-line
     if(Math.abs(delta) > 0.5){
       tp.scrollTop += delta * 0.14;             // ease ~14% of the gap per frame

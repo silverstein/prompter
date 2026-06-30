@@ -35,6 +35,11 @@ use std::collections::HashMap;
 /// selected (on top of clearing [`align::MATCH_THRESHOLD`]).
 const BRANCH_MARGIN: f32 = 0.10;
 
+/// Maximum sentences the cursor (committed or preview) may advance in a single
+/// update. A spurious far match can't fling the cursor across the script; it
+/// catches up gradually over subsequent updates instead.
+const MAX_ADVANCE: usize = 4;
+
 /// One step in the flattened script timeline. Indices into the slice returned by
 /// [`ScriptTracker::timeline`] are stable for the life of the tracker.
 #[derive(Debug, Clone, PartialEq)]
@@ -264,6 +269,12 @@ impl ScriptTracker {
         self.commit_linear();
     }
 
+    /// Set the aligner's search window (sentences each side of the cursor).
+    /// A tight window (e.g. 5-6) suits live ASR following.
+    pub fn set_window_radius(&mut self, radius: usize) {
+        self.engine.set_window_radius(radius);
+    }
+
     /// Reset to the start of the script.
     pub fn reset(&mut self) {
         self.engine.set_position(0);
@@ -325,7 +336,12 @@ impl ScriptTracker {
         }
 
         // Normal main-line alignment.
+        let prev = self.committed;
         let result = self.engine.align(text);
+        // Cap the forward jump so one false match can't fling the cursor far.
+        if self.engine.position() > prev + MAX_ADVANCE {
+            self.engine.set_position(prev + MAX_ADVANCE);
+        }
         self.committed = self.engine.position();
         self.preview = self.committed;
         if result.ad_libbing {
@@ -357,8 +373,13 @@ impl ScriptTracker {
             };
         }
         let result = self.engine.peek(text);
-        if result.matched && result.position > self.preview {
-            self.preview = result.position; // monotonic forward between commits
+        if result.matched {
+            // Forward-only, monotonic, and capped: a partial can preview ahead
+            // but never past committed + MAX_ADVANCE (no spurious far jump).
+            let capped = result.position.min(self.committed + MAX_ADVANCE);
+            if capped > self.preview {
+                self.preview = capped;
+            }
         }
         let timeline_index = self
             .main_to_timeline

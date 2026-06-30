@@ -219,8 +219,12 @@ fn init_tracking(state: tauri::State<TrackingState>, text: String) -> Result<(),
     // leave a stale tracker that later speech could feed into.
     *slot = None;
     let parsed = script::parse(&text).map_err(|e| format!("{}", e))?;
+    let mut tracker = ScriptTracker::new(&parsed);
+    // Tight search window for live ASR following: keeps the match local so a
+    // spurious far match can't throw the cursor across the script.
+    tracker.set_window_radius(6);
     *slot = Some(TrackingSession {
-        tracker: ScriptTracker::new(&parsed),
+        tracker,
         recorder: SessionRecorder::new(&parsed),
     });
     Ok(())

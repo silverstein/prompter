@@ -65,6 +65,13 @@ impl AlignmentEngine {
         self.miss_count = 0;
     }
 
+    /// Narrow or widen the search window (sentences each side of the cursor).
+    /// A tighter window suits live ASR following (prevents a spurious match far
+    /// from the cursor); the wider default suits batch/chunk alignment.
+    pub fn set_window_radius(&mut self, radius: usize) {
+        self.window_radius = radius.max(1);
+    }
+
     /// Search the window around the cursor for the best fuzzy match.
     ///
     /// Pure / non-mutating. Returns `(best_pos, best_score)`, or `None` when the
