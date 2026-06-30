@@ -665,17 +665,17 @@ function highlight(){
     else if(i===idx) el.classList.add('cur');
     else el.classList.add('up');
   });
-  // Smooth scroll: pin current sentence to ~30% from top.
-  // Only scroll if the current sentence is outside the target zone.
-  const cur=document.querySelector('.s.cur');
+  // Smooth scroll: keep the CURRENT element (sentence or pause) pinned ~40% from
+  // the top so your eye line stays in one place. One mechanism for both, so the
+  // view never yanks to re-center a pause, and it follows the cursor line-by-line.
+  const cur=document.querySelector('[data-i="'+idx+'"]');
   if(cur){
     const tp=els.tp;
     const tpRect=tp.getBoundingClientRect();
     const curRect=cur.getBoundingClientRect();
-    const targetY=tpRect.top + tpRect.height * 0.30;
+    const targetY=tpRect.top + tpRect.height * 0.40;
     const offset=curRect.top - targetY;
-    // Only scroll if more than 20px off target (prevents jitter)
-    if(Math.abs(offset) > 20){
+    if(Math.abs(offset) > 10){
       tp.scrollBy({top:offset, behavior:'smooth'});
     }
   }
@@ -683,7 +683,6 @@ function highlight(){
   document.querySelectorAll('.pause[data-i]').forEach(el=>{
     const i=+el.dataset.i;
     el.style.opacity = i===idx?'1': i<idx?'.25':'.65';
-    if(i===idx) el.scrollIntoView({behavior:'smooth',block:'center'});
   });
 
   // Show current sentence text in status bar for feedback

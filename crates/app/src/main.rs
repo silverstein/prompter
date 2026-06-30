@@ -198,6 +198,19 @@ fn track_event(u: &TrackUpdate) -> TrackEvent {
     }
 }
 
+/// The last `n` whitespace-separated words of `text`.
+///
+/// Apple's `SFSpeechRecognizer` streams the *cumulative* utterance (the whole
+/// thing, growing). The bigram-Dice aligner only matches ~1-3 sentences, so the
+/// full cumulative string stops matching a few sentences in and the cursor
+/// freezes. Feeding only the leading edge (recent words) keeps the match local,
+/// the way the prior JS matcher's "last 6 words" did.
+fn recent_words(text: &str, n: usize) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let start = words.len().saturating_sub(n);
+    words[start..].join(" ")
+}
+
 /// Start a tracking session for `text` (the .script.md source).
 #[tauri::command]
 fn init_tracking(state: tauri::State<TrackingState>, text: String) -> Result<(), String> {
@@ -377,8 +390,10 @@ fn start_speech(app: tauri::AppHandle) -> Result<String, String> {
                             // dropping tracking (which would stall the scroll).
                             let mut guard = tstate.0.lock().unwrap_or_else(|p| p.into_inner());
                             guard.as_mut().map(|s| {
+                                // Align on the leading edge (recent words), but
+                                // record the full recognized text in the transcript.
                                 let update = s.tracker.observe(&SpeechUpdate {
-                                    text: text.to_string(),
+                                    text: recent_words(text, 10),
                                     words: Vec::new(),
                                     is_final,
                                 });
