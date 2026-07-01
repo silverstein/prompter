@@ -1,18 +1,25 @@
 // ──────────────────────────────────────────────────────────────
 // Alignment engine — matches recognized speech to script position.
 //
-//   Whisper output (noisy text) ──▶ AlignmentEngine ──▶ script position
+//   ASR text (noisy, streaming) ──▶ AlignmentEngine ──▶ script position
 //
-// The engine maintains a "cursor" position in the script and searches
-// a sliding window around it for the best fuzzy match against the
-// recognized text. This corrects drift from VAD-only tracking.
+// WORD-LEVEL alignment. The reference script is stored as a flat WORD
+// sequence with a word→sentence map. Each update, the recent recognized
+// words are aligned against a BOUNDED band of reference words around the
+// current cursor using a local, monotonic dynamic-programming alignment
+// (Smith-Waterman style): a match/substitution advances the diagonal, a
+// skipped reference word is a deletion, an extra spoken word is an
+// insertion. The reference word under the LAST matched query word becomes
+// the cursor; its sentence index is what the tracker follows.
 //
-// Algorithm:
-//   1. Normalize both texts (lowercase, strip punctuation)
-//   2. Extract sliding windows from the script around the cursor
-//   3. Score each window against the recognized text using bigram overlap
-//   4. If best score exceeds threshold, update cursor to match position
-//   5. If no good match, assume ad-lib / off-script — don't move
+// This replaces an earlier char-bigram-over-sentences matcher whose Dice
+// score was dominated by sentence length, so a short recognized fragment
+// could score HIGHER on a coincidental distant sentence than on the true
+// long one it came from -- and, being forward-only, jump there and stick.
+// Word-level runs are discriminative: a coincidence yields isolated single
+// word hits that local alignment resets to zero, while genuine reading
+// yields a contiguous run. This is the reading-tutor / karaoke-alignment
+// standard; see docs/SOTA-2026-tracking.md.
 // ──────────────────────────────────────────────────────────────
 
 /// Result of an alignment attempt.
@@ -22,22 +29,53 @@ pub struct AlignResult {
     pub matched: bool,
     /// Best matching position (sentence index in the flat list).
     pub position: usize,
-    /// Confidence score (0.0–1.0).
+    /// Confidence score (0.0–1.0): match density along the aligned path.
     pub confidence: f32,
     /// Whether the speaker appears to be ad-libbing (no match found).
     pub ad_libbing: bool,
 }
 
-/// Tracks the speaker's position in the script via text alignment.
+/// Fuzzy per-word match bar: two words count as the "same" word when their
+/// character-bigram Dice similarity clears this (tolerates ASR errors and
+/// plurals, e.g. "supplements" vs "supplement"). Exact matches score 1.0.
+const WORD_MATCH: f32 = 0.7;
+/// Score charged for aligning two non-matching words on the diagonal. Strongly
+/// negative so the path prefers a gap (or a local restart) over pairing up
+/// unrelated words.
+const MISMATCH_PENALTY: f32 = -1.0;
+/// Score charged for an insertion (extra spoken word) or deletion (skipped
+/// reference word). Cheap enough to bridge a couple of skipped/ad-libbed words
+/// inside a run, dear enough that scattered coincidental hits don't add up.
+const GAP_PENALTY: f32 = -0.5;
+/// Minimum matched words on the best path to accept a match at all (one
+/// coincidental word is never enough; require a short run).
+const MIN_MATCH_WORDS: usize = 2;
+/// Minimum match density (matched words / path length) to accept a match.
+const COVERAGE_THRESHOLD: f32 = 0.5;
+
+/// Internal result of a windowed search: the reference word the alignment
+/// ends on, its sentence, a confidence, and whether it clears the bar.
+struct SearchHit {
+    end_word: usize,
+    sentence: usize,
+    confidence: f32,
+    matched: bool,
+}
+
+/// Tracks the speaker's position in the script via word-level text alignment.
 pub struct AlignmentEngine {
-    /// Flat list of normalized script sentences for matching.
-    sentences: Vec<String>,
-    /// Current estimated position (sentence index).
-    cursor: usize,
+    /// Flat list of normalized reference words.
+    words: Vec<String>,
+    /// Sentence index for each reference word.
+    word_sentence: Vec<usize>,
+    /// First reference-word index of each sentence (for cursor mapping).
+    sentence_first_word: Vec<usize>,
+    /// Number of sentences (some may contribute zero words).
+    sentence_count: usize,
+    /// Current estimated position, in reference-word units.
+    cursor_word: usize,
     /// How many sentences to search around the cursor.
     window_radius: usize,
-    /// Minimum confidence to accept a match.
-    threshold: f32,
     /// Number of consecutive failed matches (for ad-lib detection).
     miss_count: u32,
 }
@@ -45,23 +83,38 @@ pub struct AlignmentEngine {
 impl AlignmentEngine {
     /// Create a new alignment engine from script sentences.
     pub fn new(sentences: Vec<String>) -> Self {
+        let mut words = Vec::new();
+        let mut word_sentence = Vec::new();
+        let mut sentence_first_word = Vec::with_capacity(sentences.len());
+        for (si, s) in sentences.iter().enumerate() {
+            sentence_first_word.push(words.len());
+            for w in normalize(s).split_whitespace() {
+                words.push(w.to_string());
+                word_sentence.push(si);
+            }
+        }
         Self {
-            sentences,
-            cursor: 0,
+            sentence_count: sentences.len(),
+            words,
+            word_sentence,
+            sentence_first_word,
+            cursor_word: 0,
             window_radius: 15, // Search ±15 sentences (~30 sentence window)
-            threshold: 0.35,   // 35% bigram overlap required
             miss_count: 0,
         }
     }
 
-    /// Get the current estimated position.
+    /// Get the current estimated position (sentence index).
     pub fn position(&self) -> usize {
-        self.cursor
+        self.word_sentence.get(self.cursor_word).copied().unwrap_or(0)
     }
 
-    /// Set the cursor position (e.g., when user manually navigates).
-    pub fn set_position(&mut self, pos: usize) {
-        self.cursor = pos.min(self.sentences.len().saturating_sub(1));
+    /// Set the cursor position by sentence (e.g., manual navigation, or the
+    /// tracker sliding the search window during partials).
+    pub fn set_position(&mut self, sentence: usize) {
+        let s = sentence.min(self.sentence_count.saturating_sub(1));
+        let w = self.sentence_first_word.get(s).copied().unwrap_or(0);
+        self.cursor_word = w.min(self.words.len().saturating_sub(1));
         self.miss_count = 0;
     }
 
@@ -72,108 +125,159 @@ impl AlignmentEngine {
         self.window_radius = radius.max(1);
     }
 
-    /// Search the window around the cursor for the best fuzzy match.
-    ///
-    /// Pure / non-mutating. Returns `(best_pos, best_score)`, or `None` when the
-    /// input is too short or has no usable bigrams to match. Shared by `align`
-    /// (which commits) and `peek` (which does not).
-    fn search(&self, recognized: &str) -> Option<(usize, f32)> {
-        let recognized = normalize(recognized);
-        if recognized.len() < 10 {
-            // Too short to match reliably.
+    /// Align the recent recognized words against a bounded band of reference
+    /// words around the cursor with a local, monotonic DP. Pure / non-mutating.
+    /// Shared by `align` (which commits) and `peek` (which does not).
+    fn search(&self, recognized: &str) -> Option<SearchHit> {
+        if self.words.is_empty() {
+            return None;
+        }
+        let norm = normalize(recognized);
+        let q: Vec<&str> = norm.split_whitespace().collect();
+        if q.len() < 2 {
+            // Need at least a two-word run to align reliably.
             return None;
         }
 
-        let rec_bigrams = bigrams(&recognized);
-        if rec_bigrams.is_empty() {
+        // Reference band: window_radius sentences each side of the cursor, in
+        // words. Bounding the band is what makes a distant coincidence not even
+        // a candidate.
+        let cur_sent = self.position();
+        let lo = cur_sent.saturating_sub(self.window_radius);
+        let hi = (cur_sent + self.window_radius).min(self.sentence_count.saturating_sub(1));
+        let r_start = self.sentence_first_word[lo];
+        let r_end = if hi + 1 < self.sentence_count {
+            self.sentence_first_word[hi + 1]
+        } else {
+            self.words.len()
+        };
+        let r = &self.words[r_start..r_end];
+        if r.is_empty() {
             return None;
         }
 
-        let n = self.sentences.len();
-        let start = self.cursor.saturating_sub(self.window_radius);
-        let end = (self.cursor + self.window_radius + 1).min(n);
+        let m = q.len();
+        let n = r.len();
+        // h = running score, mc = matched-word count, pl = path length (steps
+        // since the last local restart) -- all for the best path to each cell.
+        let mut h = vec![vec![0.0f32; n + 1]; m + 1];
+        let mut mc = vec![vec![0usize; n + 1]; m + 1];
+        let mut pl = vec![vec![0usize; n + 1]; m + 1];
 
-        let mut best_adjusted: f32 = f32::MIN;
-        let mut best_pos = self.cursor;
-        let mut best_raw: f32 = 0.0;
+        let cursor_local = self.cursor_word.saturating_sub(r_start) as isize;
+        let mut best = 0.0f32;
+        let mut best_j = 0usize;
+        let mut best_mc = 0usize;
+        let mut best_pl = 0usize;
 
-        for i in start..end {
-            // Best RAW bigram score for a match starting at i: a single sentence
-            // or a 2-3 sentence window (one recognized chunk may span a couple of
-            // short script sentences).
-            let mut raw = bigram_similarity(&rec_bigrams, &self.sentences[i]);
-            if i + 1 < n {
-                let combined = format!("{} {}", self.sentences[i], self.sentences[i + 1]);
-                raw = raw.max(bigram_similarity(&rec_bigrams, &combined));
-            }
-            if i + 2 < n {
-                let combined = format!(
-                    "{} {} {}",
-                    self.sentences[i],
-                    self.sentences[i + 1],
-                    self.sentences[i + 2]
-                );
-                raw = raw.max(bigram_similarity(&rec_bigrams, &combined));
-            }
+        for i in 1..=m {
+            for j in 1..=n {
+                let sim = word_sim(q[i - 1], &r[j - 1]);
+                let is_match = sim >= WORD_MATCH;
+                let diag = h[i - 1][j - 1] + if is_match { sim } else { MISMATCH_PENALTY };
+                let up = h[i - 1][j] + GAP_PENALTY; // extra spoken word (insertion)
+                let left = h[i][j - 1] + GAP_PENALTY; // skipped ref word (deletion)
 
-            // Locality bias. A short or ambiguous recognized fragment can score
-            // HIGHER on a coincidental distant sentence (shared common character
-            // bigrams) than on the true, long sentence it actually came from --
-            // char-bigram Dice is dominated by length. Without a distance cost the
-            // cursor jumps to that far match and, being forward-only, sticks
-            // there (observed: "Between your supplements that" scored 0.354 on a
-            // sentence 3 ahead vs 0.280 on the true one). The penalty makes a
-            // distant candidate win only when it is CLEARLY stronger, not merely
-            // coincidentally higher. It biases SELECTION only; the acceptance
-            // threshold below uses `best_raw`, so a genuine local advance that
-            // sits just above threshold is never penalized out (and an ambiguous
-            // fragment simply keeps the cursor put instead of flinging it away).
-            let dist = (i as isize - self.cursor as isize).unsigned_abs() as f32;
-            let adjusted = raw - LOCALITY_PENALTY * dist;
-            if adjusted > best_adjusted {
-                best_adjusted = adjusted;
-                best_pos = i;
-                best_raw = raw;
+                // Local alignment: a running score never drops below zero (a bad
+                // stretch restarts the path rather than dragging it negative).
+                let mut score = 0.0f32;
+                let mut count = 0usize;
+                let mut plen = 0usize;
+                if diag > score {
+                    score = diag;
+                    count = mc[i - 1][j - 1] + usize::from(is_match);
+                    plen = pl[i - 1][j - 1] + 1;
+                }
+                if up > score {
+                    score = up;
+                    count = mc[i - 1][j];
+                    plen = pl[i - 1][j] + 1;
+                }
+                if left > score {
+                    score = left;
+                    count = mc[i][j - 1];
+                    plen = pl[i][j - 1] + 1;
+                }
+                h[i][j] = score;
+                mc[i][j] = count;
+                pl[i][j] = plen;
+
+                // Track the best endpoint. Prefer higher score; on a near-tie
+                // prefer the endpoint nearest the cursor, so a phrase that
+                // repeats in the script resolves to the occurrence we're at.
+                if count > 0 {
+                    let take = score > best + 1e-4
+                        || ((score - best).abs() <= 1e-4
+                            && (j as isize - cursor_local).abs()
+                                < (best_j as isize - cursor_local).abs());
+                    if take {
+                        best = score;
+                        best_j = j;
+                        best_mc = count;
+                        best_pl = plen;
+                    }
+                }
             }
         }
 
-        Some((best_pos, best_raw))
+        if best_mc == 0 || best_pl == 0 {
+            // Evaluated, but nothing aligned: a real miss (ad-lib / off-script),
+            // which must count toward ad-lib detection. This is distinct from
+            // "couldn't evaluate" (too short / empty band) returned as None
+            // above, which is not a miss.
+            return Some(SearchHit {
+                end_word: self.cursor_word,
+                sentence: self.position(),
+                confidence: 0.0,
+                matched: false,
+            });
+        }
+        let end_word = r_start + best_j - 1;
+        let sentence = self.word_sentence[end_word];
+        // Confidence = match density along the aligned path (1.0 = every step
+        // was a matched word; lower when the run needed gaps to bridge).
+        let confidence = (best_mc as f32 / best_pl as f32).clamp(0.0, 1.0);
+        let matched = best_mc >= MIN_MATCH_WORDS && confidence >= COVERAGE_THRESHOLD;
+        Some(SearchHit {
+            end_word,
+            sentence,
+            confidence,
+            matched,
+        })
     }
 
-    /// Attempt to align recognized text against the script and COMMIT the
-    /// result: on a confident match the cursor advances (forward, or a small
-    /// back-jump for re-reading) and miss-state resets; on a miss the miss
-    /// counter increments (feeding ad-lib detection). Use this for stabilized /
-    /// final hypotheses.
+    /// Attempt to align recognized text and COMMIT: on a confident match the
+    /// cursor advances (forward, or a small back-jump for re-reading) and
+    /// miss-state resets; on a miss the miss counter increments (feeding ad-lib
+    /// detection). Use this for stabilized / final hypotheses.
     pub fn align(&mut self, recognized: &str) -> AlignResult {
-        let Some((best_pos, best_score)) = self.search(recognized) else {
+        let Some(hit) = self.search(recognized) else {
             return AlignResult {
                 matched: false,
-                position: self.cursor,
+                position: self.position(),
                 confidence: 0.0,
                 ad_libbing: self.miss_count > 5,
             };
         };
-
-        if best_score >= self.threshold {
-            // Good match — update cursor.
-            // Only advance forward or allow small backward jumps (re-reading).
-            if best_pos >= self.cursor || self.cursor - best_pos <= 3 {
-                self.cursor = best_pos;
+        if hit.matched {
+            let cur = self.position();
+            // Advance forward, or allow a small backward jump (re-reading).
+            if hit.sentence >= cur || cur - hit.sentence <= 3 {
+                self.cursor_word = hit.end_word;
             }
             self.miss_count = 0;
             AlignResult {
                 matched: true,
-                position: best_pos,
-                confidence: best_score,
+                position: hit.sentence,
+                confidence: hit.confidence,
                 ad_libbing: false,
             }
         } else {
             self.miss_count += 1;
             AlignResult {
                 matched: false,
-                position: self.cursor,
-                confidence: best_score,
+                position: self.position(),
+                confidence: hit.confidence,
                 ad_libbing: self.miss_count > 5,
             }
         }
@@ -182,30 +286,45 @@ impl AlignmentEngine {
     /// Non-mutating alignment: compute the best match WITHOUT moving the cursor
     /// or touching miss-state. Use this for partial / volatile hypotheses so a
     /// revised-before-final recognition ("flicker") cannot commit a wrong jump.
-    /// On a confident match `position` is the matched index; otherwise it stays
-    /// at the current cursor.
+    /// On a confident match `position` is the matched sentence; otherwise it
+    /// stays at the current cursor.
     pub fn peek(&self, recognized: &str) -> AlignResult {
         match self.search(recognized) {
-            Some((best_pos, best_score)) if best_score >= self.threshold => AlignResult {
+            Some(hit) if hit.matched => AlignResult {
                 matched: true,
-                position: best_pos,
-                confidence: best_score,
+                position: hit.sentence,
+                confidence: hit.confidence,
                 ad_libbing: false,
             },
-            Some((_, best_score)) => AlignResult {
+            Some(hit) => AlignResult {
                 matched: false,
-                position: self.cursor,
-                confidence: best_score,
+                position: self.position(),
+                confidence: hit.confidence,
                 ad_libbing: self.miss_count > 5,
             },
             None => AlignResult {
                 matched: false,
-                position: self.cursor,
+                position: self.position(),
                 confidence: 0.0,
                 ad_libbing: self.miss_count > 5,
             },
         }
     }
+}
+
+/// Per-word similarity for alignment. Exact (normalized) words score 1.0; short
+/// words (<=3 chars) match ONLY exactly, to avoid "the"~"she" style bigram
+/// coincidences; longer words fuzzy-match via character-bigram Dice so ASR
+/// errors and plurals still align.
+fn word_sim(a: &str, b: &str) -> f32 {
+    if a == b {
+        return 1.0;
+    }
+    if a.len() <= 3 || b.len() <= 3 {
+        return 0.0;
+    }
+    let ab = bigrams(a);
+    bigram_similarity(&ab, b)
 }
 
 /// Normalize text for comparison: lowercase, strip punctuation, collapse whitespace.
@@ -233,8 +352,8 @@ fn bigrams(text: &str) -> Vec<[u8; 2]> {
     bytes.windows(2).map(|w| [w[0], w[1]]).collect()
 }
 
-/// Compute bigram similarity between recognized text bigrams and a reference string.
-/// Returns 0.0–1.0 (Dice coefficient of bigram sets).
+/// Compute bigram similarity between recognized text bigrams and a reference
+/// string. Returns 0.0–1.0 (Dice coefficient of bigram sets).
 fn bigram_similarity(rec_bigrams: &[[u8; 2]], reference: &str) -> f32 {
     let ref_normalized = normalize(reference);
     let ref_bigrams = bigrams(&ref_normalized);
@@ -260,24 +379,16 @@ fn bigram_similarity(rec_bigrams: &[[u8; 2]], reference: &str) -> f32 {
     2.0 * matches as f32 / (rec_bigrams.len() + ref_bigrams.len()) as f32
 }
 
-/// Minimum bigram-Dice similarity for a confident match (the engine's internal
-/// alignment threshold). Exposed so callers that score outside an
-/// [`AlignmentEngine`] (e.g. choosing among branch options) use the same bar.
+/// Minimum bigram-Dice similarity for a confident match. Used by callers that
+/// score whole strings outside an [`AlignmentEngine`] (e.g. choosing among
+/// branch options, return-to-main detection), where a single Dice score over
+/// the full option text is the right tool.
 pub const MATCH_THRESHOLD: f32 = 0.35;
-
-/// Per-sentence distance cost used to bias windowed search toward the current
-/// cursor (locality / forward bias). Subtracted from a candidate's raw score
-/// per sentence of distance when SELECTING the best match, so a coincidental
-/// far match must beat a near one by this much per sentence to win. Small
-/// enough not to block genuine local advances (which score well above their
-/// neighbours), large enough to reject an ambiguous fragment's far coincidence
-/// (0.03/sentence => a match 3 ahead must be >0.09 stronger to jump).
-const LOCALITY_PENALTY: f32 = 0.03;
 
 /// Bigram-Dice similarity (0.0-1.0) between recognized text and a reference
 /// string, applying the same normalization the engine uses. A standalone scorer
-/// for one-off comparisons (branch-option selection, return-to-main detection)
-/// that do not warrant a full windowed [`AlignmentEngine`] pass.
+/// for one-off whole-string comparisons (branch-option selection, return-to-main
+/// detection) that do not warrant a full windowed [`AlignmentEngine`] pass.
 pub fn similarity(recognized: &str, reference: &str) -> f32 {
     let normalized = normalize(recognized);
     let rec_bigrams = bigrams(&normalized);
@@ -347,16 +458,16 @@ mod tests {
     }
 
     #[test]
-    fn locality_bias_keeps_ambiguous_fragment_from_jumping_forward() {
+    fn word_level_matches_fragment_on_the_true_long_sentence() {
         // Real regression from a recorded read. While reading the long sentence
-        // at idx 3, the recognizer re-segmented down to the short fragment
-        // "between your supplements that". That fragment scores HIGHER (char
-        // bigrams) on the coincidental short sentence at idx 6 (~0.354) than on
-        // the true long sentence at idx 3 (~0.280) that literally contains those
-        // words -- Dice is dominated by length. Without locality bias the cursor
-        // jumps +3 to the coincidence and, being forward-only, sticks (the
-        // reported "it jumped to another part of the script"). Locality bias must
-        // keep it put.
+        // at idx 3, the recognizer re-segmented to the short fragment "between
+        // your supplements that". The OLD char-bigram matcher scored that
+        // fragment HIGHER on a coincidental short sentence 3 lines down (idx 6,
+        // ~0.354) than on the true long sentence that literally contains those
+        // words (idx 3, ~0.280), so the cursor jumped +3 and stuck. Word-level
+        // alignment matches the actual words (between/your ... supplements/that,
+        // bridging the intervening reference words as a gap), so it lands on the
+        // TRUE sentence, not the coincidence.
         let sentences = vec![
             "hi thanks for meeting with me today".into(),
             "it sounds like these symptoms have been really worrying you".into(),
@@ -371,11 +482,8 @@ mod tests {
         eng.set_window_radius(10);
         eng.set_position(3);
         let r = eng.peek("between your supplements that");
-        assert!(
-            r.position <= 3,
-            "ambiguous fragment jumped forward to idx {} (expected <= 3)",
-            r.position
-        );
+        assert!(r.matched, "fragment should match the true sentence");
+        assert_eq!(r.position, 3, "must land on the true sentence, not jump ahead");
     }
 
     #[test]

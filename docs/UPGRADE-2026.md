@@ -172,9 +172,12 @@ for `isFinal` to scroll. Model choice is the latency budget; alignment compute i
 
 ### Known limitations (core, documented intentionally)
 
-- A combined 2-3 sentence aligner window commits the window *start*, so reading two sentences in a
-  single recognized final marks only the first covered (a conservative under-count, the safe
-  direction for compliance). Surfacing the full matched span would need the aligner to return it.
+- The aligner is word-level (a bounded, monotonic local DP over words; see
+  `docs/SOTA-2026-tracking.md`). The cursor lands on the sentence of the last matched word, so
+  reading across a sentence boundary in one recognized chunk advances correctly. It replaced the
+  earlier char-bigram-over-sentences matcher whose length bias let a short fragment jump to a
+  coincidental distant sentence. `similarity()` (char-bigram Dice) is retained only for whole-string
+  branch-option scoring and return-to-main detection.
 - Duplicate branch questions and consecutive / branch-adjacent pauses are not individually
   represented (`branches_taken` and the pause model key on question / preceding-sentence).
 - Branch return-to-main relies on the post-branch sentence being within the aligner's window
