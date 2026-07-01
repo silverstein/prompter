@@ -52,6 +52,15 @@ const GAP_PENALTY: f32 = -0.5;
 const MIN_MATCH_WORDS: usize = 2;
 /// Minimum match density (matched words / path length) to accept a match.
 const COVERAGE_THRESHOLD: f32 = 0.5;
+/// Per-word distance cost that biases endpoint selection toward the cursor.
+/// Scripts repeat phrases (e.g. "St. John's Wort", "garlic extract" recur), so a
+/// messy recognized tail can match a FORWARD occurrence as well as the near one;
+/// without a continuity cost the cursor jumps ahead to the repeat. Subtracted per
+/// reference word of distance from the cursor when choosing the best endpoint, so
+/// a distant occurrence must be clearly stronger to win. Small enough that a
+/// normal next-sentence advance (whose near alternative has no match at all) is
+/// never blocked; the acceptance threshold still uses the raw density.
+const WORD_LOCALITY: f32 = 0.06;
 
 /// Internal result of a windowed search: the reference word the alignment
 /// ends on, its sentence, a confidence, and whether it clears the bar.
@@ -165,7 +174,8 @@ impl AlignmentEngine {
         let mut pl = vec![vec![0usize; n + 1]; m + 1];
 
         let cursor_local = self.cursor_word.saturating_sub(r_start) as isize;
-        let mut best = 0.0f32;
+        let mut best = 0.0f32; // raw score at the chosen endpoint
+        let mut best_adj = f32::MIN; // locality-adjusted score used for selection
         let mut best_j = 0usize;
         let mut best_mc = 0usize;
         let mut best_pl = 0usize;
@@ -202,15 +212,16 @@ impl AlignmentEngine {
                 mc[i][j] = count;
                 pl[i][j] = plen;
 
-                // Track the best endpoint. Prefer higher score; on a near-tie
-                // prefer the endpoint nearest the cursor, so a phrase that
-                // repeats in the script resolves to the occurrence we're at.
+                // Track the best endpoint by a locality-adjusted score: the raw
+                // run score minus a per-word distance cost from the cursor. A
+                // phrase that repeats in the script (so a messy tail matches both
+                // the near occurrence and a forward one) resolves to the one we're
+                // actually at, unless the distant match is clearly stronger.
                 if count > 0 {
-                    let take = score > best + 1e-4
-                        || ((score - best).abs() <= 1e-4
-                            && (j as isize - cursor_local).abs()
-                                < (best_j as isize - cursor_local).abs());
-                    if take {
+                    let dist = (j as isize - cursor_local).unsigned_abs() as f32;
+                    let adj = score - WORD_LOCALITY * dist;
+                    if adj > best_adj + 1e-4 {
+                        best_adj = adj;
                         best = score;
                         best_j = j;
                         best_mc = count;
@@ -484,6 +495,36 @@ mod tests {
         let r = eng.peek("between your supplements that");
         assert!(r.matched, "fragment should match the true sentence");
         assert_eq!(r.position, 3, "must land on the true sentence, not jump ahead");
+    }
+
+    #[test]
+    fn repeated_phrase_does_not_jump_to_a_forward_occurrence() {
+        // "st johns wort" recurs: once in the supplements list being read, then
+        // again when it's discussed later. A messy ASR tail containing the
+        // repeated phrase must resolve to the NEAR occurrence, not jump forward
+        // to the later mention. Regression for the "both garlic extract" +4 jump
+        // (recording3): word-level alignment matched the forward "...taking St.
+        // John's Wort" as well as the near one, and the forward occurrence won
+        // until the locality bias was added.
+        let sentences = vec![
+            "let me explain how this works".into(),
+            "you are currently taking garlic extract ginkgo biloba and st johns wort".into(),
+            "both garlic extract and ginkgo biloba have a strong blood thinning effect".into(),
+            "when you combine them with your warfarin it doubles up that effect".into(),
+            "this makes your blood much too thin which is dangerous".into(),
+            "it is a major safety red flag".into(),
+            "but on the other hand you are also taking st johns wort".into(),
+            "st johns wort actually does the exact opposite".into(),
+        ];
+        let mut eng = AlignmentEngine::new(sentences);
+        eng.set_window_radius(10);
+        eng.set_position(1); // reading the supplements list
+        let r = eng.peek("taking garlic extract st johns wort st johns");
+        assert!(
+            r.position <= 2,
+            "jumped forward to the repeated phrase at idx {}",
+            r.position
+        );
     }
 
     #[test]
