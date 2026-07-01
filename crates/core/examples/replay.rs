@@ -64,8 +64,8 @@ fn main() {
                 total = t.sentence_count();
                 recorder = Some(SessionRecorder::new(&parsed));
                 println!(
-                    "# {total} main sentences | window={window} tail={tail}\n# {:>8} {} {:>4} {:>5}  {:<9} tail",
-                    "t(ms)", "F", "idx", "d", "state"
+                    "# {total} main sentences | window={window} tail={tail}\n# {:>8} {} {:>4} {:>5} {:>4}  {:<9} tail",
+                    "t(ms)", "F", "idx", "d", "conf", "state"
                 );
                 tracker = Some(t);
             }
@@ -101,11 +101,13 @@ fn main() {
                     .split(|c| c == ' ' || c == '{')
                     .next()
                     .unwrap_or(&state);
+                let flag = if delta.abs() >= 2 { " <== JUMP" } else { "" };
                 println!(
-                    "{t:>10} {} {:>4} {:>+5}  {state:<9} {lead}",
+                    "{t:>10} {} {:>4} {:>+5} {:>4.2}  {state:<9} {lead}{flag}",
                     if is_final { "F" } else { "." },
                     u.sentence_index,
-                    delta
+                    delta,
+                    u.confidence,
                 );
             }
             _ => {}

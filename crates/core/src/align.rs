@@ -93,29 +93,19 @@ impl AlignmentEngine {
         let start = self.cursor.saturating_sub(self.window_radius);
         let end = (self.cursor + self.window_radius + 1).min(n);
 
-        let mut best_score: f32 = 0.0;
+        let mut best_adjusted: f32 = f32::MIN;
         let mut best_pos = self.cursor;
+        let mut best_raw: f32 = 0.0;
 
-        // Try matching against individual sentences and 2-3 sentence windows.
         for i in start..end {
-            // Single sentence
-            let score = bigram_similarity(&rec_bigrams, &self.sentences[i]);
-            if score > best_score {
-                best_score = score;
-                best_pos = i;
-            }
-
-            // Two-sentence window (current + next)
+            // Best RAW bigram score for a match starting at i: a single sentence
+            // or a 2-3 sentence window (one recognized chunk may span a couple of
+            // short script sentences).
+            let mut raw = bigram_similarity(&rec_bigrams, &self.sentences[i]);
             if i + 1 < n {
                 let combined = format!("{} {}", self.sentences[i], self.sentences[i + 1]);
-                let score = bigram_similarity(&rec_bigrams, &combined);
-                if score > best_score {
-                    best_score = score;
-                    best_pos = i;
-                }
+                raw = raw.max(bigram_similarity(&rec_bigrams, &combined));
             }
-
-            // Three-sentence window
             if i + 2 < n {
                 let combined = format!(
                     "{} {} {}",
@@ -123,15 +113,31 @@ impl AlignmentEngine {
                     self.sentences[i + 1],
                     self.sentences[i + 2]
                 );
-                let score = bigram_similarity(&rec_bigrams, &combined);
-                if score > best_score {
-                    best_score = score;
-                    best_pos = i;
-                }
+                raw = raw.max(bigram_similarity(&rec_bigrams, &combined));
+            }
+
+            // Locality bias. A short or ambiguous recognized fragment can score
+            // HIGHER on a coincidental distant sentence (shared common character
+            // bigrams) than on the true, long sentence it actually came from --
+            // char-bigram Dice is dominated by length. Without a distance cost the
+            // cursor jumps to that far match and, being forward-only, sticks
+            // there (observed: "Between your supplements that" scored 0.354 on a
+            // sentence 3 ahead vs 0.280 on the true one). The penalty makes a
+            // distant candidate win only when it is CLEARLY stronger, not merely
+            // coincidentally higher. It biases SELECTION only; the acceptance
+            // threshold below uses `best_raw`, so a genuine local advance that
+            // sits just above threshold is never penalized out (and an ambiguous
+            // fragment simply keeps the cursor put instead of flinging it away).
+            let dist = (i as isize - self.cursor as isize).unsigned_abs() as f32;
+            let adjusted = raw - LOCALITY_PENALTY * dist;
+            if adjusted > best_adjusted {
+                best_adjusted = adjusted;
+                best_pos = i;
+                best_raw = raw;
             }
         }
 
-        Some((best_pos, best_score))
+        Some((best_pos, best_raw))
     }
 
     /// Attempt to align recognized text against the script and COMMIT the
@@ -259,6 +265,15 @@ fn bigram_similarity(rec_bigrams: &[[u8; 2]], reference: &str) -> f32 {
 /// [`AlignmentEngine`] (e.g. choosing among branch options) use the same bar.
 pub const MATCH_THRESHOLD: f32 = 0.35;
 
+/// Per-sentence distance cost used to bias windowed search toward the current
+/// cursor (locality / forward bias). Subtracted from a candidate's raw score
+/// per sentence of distance when SELECTING the best match, so a coincidental
+/// far match must beat a near one by this much per sentence to win. Small
+/// enough not to block genuine local advances (which score well above their
+/// neighbours), large enough to reject an ambiguous fragment's far coincidence
+/// (0.03/sentence => a match 3 ahead must be >0.09 stronger to jump).
+const LOCALITY_PENALTY: f32 = 0.03;
+
 /// Bigram-Dice similarity (0.0-1.0) between recognized text and a reference
 /// string, applying the same normalization the engine uses. A standalone scorer
 /// for one-off comparisons (branch-option selection, return-to-main detection)
@@ -329,6 +344,38 @@ mod tests {
         assert!(r.matched);
         assert_eq!(r.position, 6);
         assert_eq!(eng.position(), 0, "peek must not move the committed cursor");
+    }
+
+    #[test]
+    fn locality_bias_keeps_ambiguous_fragment_from_jumping_forward() {
+        // Real regression from a recorded read. While reading the long sentence
+        // at idx 3, the recognizer re-segmented down to the short fragment
+        // "between your supplements that". That fragment scores HIGHER (char
+        // bigrams) on the coincidental short sentence at idx 6 (~0.354) than on
+        // the true long sentence at idx 3 (~0.280) that literally contains those
+        // words -- Dice is dominated by length. Without locality bias the cursor
+        // jumps +3 to the coincidence and, being forward-only, sticks (the
+        // reported "it jumped to another part of the script"). Locality bias must
+        // keep it put.
+        let sentences = vec![
+            "hi thanks for meeting with me today".into(),
+            "it sounds like these symptoms have been really worrying you".into(),
+            "and to be completely honest they caught my attention right away".into(),
+            "ive reviewed your profile and found a few critical things going on between your prescriptions and your supplements that we need to handle today to keep you safe".into(),
+            "ive flagged this so im fixing it by putting together a clear simple plan".into(),
+            "i know this can feel like a lot thats why im here to guide you through it".into(),
+            "let me walk you through exactly what i see happening".into(),
+            "the most urgent thing i found today relates to your symptoms".into(),
+        ];
+        let mut eng = AlignmentEngine::new(sentences);
+        eng.set_window_radius(10);
+        eng.set_position(3);
+        let r = eng.peek("between your supplements that");
+        assert!(
+            r.position <= 3,
+            "ambiguous fragment jumped forward to idx {} (expected <= 3)",
+            r.position
+        );
     }
 
     #[test]
