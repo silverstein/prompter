@@ -694,34 +694,65 @@ struct CoachingInsight {
     advice: String,
 }
 
-/// Find a script file by consultation_id in the watched folder.
+/// Find a script file by consultation_id.
+///
+/// Searches the watched scripts folder AND `~/Downloads`. The id-based deep
+/// link (SynapseRx "Open in Prompter") carries only the consultation id, so we
+/// resolve it to a local file by matching the filename or the frontmatter
+/// `consultation_id`. The SynapseRx "Download" export lands the `.script.md` in
+/// `~/Downloads` (browser default), so without the Downloads fallback a
+/// freshly-downloaded consultation is invisible to the deep link and the app
+/// reports "No script found". Picks the most recently modified match so a
+/// re-export / newer download wins.
 fn find_script_by_consultation_id(consultation_id: &str) -> Option<String> {
     let home = dirs_next::home_dir()?;
-    let scripts_dir = home.join("meetings").join("scripts");
+    let dirs = [
+        home.join("meetings").join("scripts"),
+        home.join("Downloads"),
+    ];
 
-    if let Ok(entries) = fs::read_dir(&scripts_dir) {
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for dir in &dirs {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            // Check filename contains the consultation_id
+            let mut matched = false;
+            // Check filename contains the consultation_id.
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name.contains(consultation_id) {
-                    return Some(path.to_string_lossy().to_string());
+                    matched = true;
                 }
             }
-            // Also check frontmatter for consultation_id field
-            if let Ok(content) = fs::read_to_string(&path) {
-                if content.contains(&format!("consultation_id: \"{}\"", consultation_id))
-                    || content.contains(&format!("consultation_id: {}", consultation_id))
-                {
-                    return Some(path.to_string_lossy().to_string());
+            // Otherwise check the frontmatter `consultation_id` field (the
+            // download filename is a case reference, not the raw id, so this is
+            // the reliable match for a downloaded export).
+            if !matched {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if content.contains(&format!("consultation_id: \"{consultation_id}\""))
+                        || content.contains(&format!("consultation_id: {consultation_id}"))
+                    {
+                        matched = true;
+                    }
+                }
+            }
+            if matched {
+                let mtime = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                if best.as_ref().map_or(true, |(t, _)| mtime > *t) {
+                    best = Some((mtime, path.to_string_lossy().to_string()));
                 }
             }
         }
     }
-    None
+    best.map(|(_, path)| path)
 }
 
 /// Parse a deep link URL and extract parameters.
