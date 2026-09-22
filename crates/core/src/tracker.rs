@@ -40,6 +40,17 @@ const BRANCH_MARGIN: f32 = 0.10;
 /// catches up gradually over subsequent updates instead.
 const MAX_ADVANCE: usize = 4;
 
+/// Relocator bar (the coarse whole-script tracker, borrowed from opera score
+/// following). When the local aligner finds nothing, a whole-script search may
+/// move the cursor far away -- a real skip, or going back to re-read -- but only
+/// on strong, repeated evidence: at least this many matched words...
+const RELOCATE_MIN_WORDS: usize = 5;
+/// ...at this match density...
+const RELOCATE_MIN_CONFIDENCE: f32 = 0.8;
+/// ...agreed on by this many successive updates that keep reading forward in
+/// the same passage. One coincidental phrase can never move the cursor.
+const RELOCATE_AGREEMENT: u8 = 3;
+
 /// One step in the flattened script timeline. Indices into the slice returned by
 /// [`ScriptTracker::timeline`] are stable for the life of the tracker.
 #[derive(Debug, Clone, PartialEq)]
@@ -105,6 +116,17 @@ pub struct TrackUpdate {
     pub state: TrackState,
     /// Set on the committed update that selects a branch option.
     pub branch_choice: Option<BranchChoice>,
+    /// True when the whole-script relocator moved the cursor (possibly
+    /// backward). The UI must follow even if it is behind its own position.
+    pub relocated: bool,
+}
+
+/// A far-away passage the relocator is considering.
+#[derive(Debug, Clone, Copy)]
+struct RelocateCandidate {
+    sentence: usize,
+    end_word: usize,
+    hits: u8,
 }
 
 struct BranchData {
@@ -143,6 +165,7 @@ pub struct ScriptTracker {
     preview: usize,
     committed_timeline: usize,
     committed_state: TrackState,
+    relocate: Option<RelocateCandidate>,
 }
 
 impl ScriptTracker {
@@ -240,6 +263,7 @@ impl ScriptTracker {
             preview: 0,
             committed_timeline,
             committed_state: TrackState::Speaking,
+            relocate: None,
         }
     }
 
@@ -266,6 +290,7 @@ impl ScriptTracker {
     /// Manually move the cursor; re-derives linear/awaiting-branch mode + state.
     pub fn set_position(&mut self, sentence_index: usize) {
         self.engine.set_position(sentence_index);
+        self.relocate = None;
         self.commit_linear();
     }
 
@@ -283,6 +308,7 @@ impl ScriptTracker {
         self.mode = Mode::Linear;
         self.committed_state = TrackState::Speaking;
         self.committed_timeline = self.main_to_timeline.first().copied().unwrap_or(0);
+        self.relocate = None;
     }
 
     /// Observe one recognition update and return the resulting position/state.
@@ -296,6 +322,7 @@ impl ScriptTracker {
                 confidence: 0.0,
                 state: TrackState::Speaking,
                 branch_choice: None,
+                relocated: false,
             };
         }
         if update.is_final {
@@ -333,6 +360,16 @@ impl ScriptTracker {
                 return selected;
             }
             // No option chosen -> fall through to main alignment.
+        }
+
+        // Nothing local: give the whole-script relocator a look before the
+        // aligner records a miss.
+        if !self.engine.peek(text).matched {
+            if let Some(u) = self.try_relocate(text) {
+                return u;
+            }
+        } else {
+            self.relocate = None;
         }
 
         // Normal main-line alignment. Floor the forward-jump cap at the live
@@ -388,9 +425,17 @@ impl ScriptTracker {
                 confidence: 0.0,
                 state: self.committed_state.clone(),
                 branch_choice: None,
+                relocated: false,
             };
         }
         let result = self.engine.peek(text);
+        if !result.matched {
+            if let Some(u) = self.try_relocate(text) {
+                return u;
+            }
+        } else {
+            self.relocate = None;
+        }
         if result.matched {
             // Forward-only, monotonic, rate-limited: a partial can preview ahead
             // but at most MAX_ADVANCE past the *live cursor* (`preview`) per
@@ -433,7 +478,53 @@ impl ScriptTracker {
             // not only after a final lands (which may never happen). Pure lookup.
             state: self.linear_state_at(self.preview),
             branch_choice: None,
+            relocated: false,
         }
+    }
+
+    /// The coarse whole-script tracker. Called only when the local aligner has
+    /// no match. Moves the cursor to a distant passage once
+    /// [`RELOCATE_AGREEMENT`] successive updates agree on it, reading forward.
+    fn try_relocate(&mut self, text: &str) -> Option<TrackUpdate> {
+        let Some(hit) = self.engine.locate_global(text) else {
+            self.relocate = None;
+            return None;
+        };
+        if hit.matched_words < RELOCATE_MIN_WORDS || hit.confidence < RELOCATE_MIN_CONFIDENCE {
+            self.relocate = None;
+            return None;
+        }
+        // Near the cursor the local aligner is in charge.
+        let cur = self.committed.max(self.preview);
+        if hit.sentence + 3 >= cur && hit.sentence <= cur + MAX_ADVANCE {
+            self.relocate = None;
+            return None;
+        }
+        let hits = match self.relocate {
+            Some(c) if c.sentence.abs_diff(hit.sentence) <= 2 && hit.end_word > c.end_word => {
+                c.hits + 1
+            }
+            // Same text again (a repeated partial) is not new evidence.
+            Some(c) if c.sentence.abs_diff(hit.sentence) <= 2 && hit.end_word == c.end_word => {
+                c.hits
+            }
+            _ => 1,
+        };
+        self.relocate = Some(RelocateCandidate {
+            sentence: hit.sentence,
+            end_word: hit.end_word,
+            hits,
+        });
+        if hits < RELOCATE_AGREEMENT {
+            return None;
+        }
+        self.relocate = None;
+        self.engine.set_position(hit.sentence);
+        self.mode = Mode::Linear;
+        self.commit_linear();
+        let mut u = self.committed_update(true, None);
+        u.relocated = true;
+        Some(u)
     }
 
     /// Try to select an option of `branch` from `text`; on success transition to
@@ -521,6 +612,7 @@ impl ScriptTracker {
             confidence: if matched { 1.0 } else { 0.0 },
             state: self.committed_state.clone(),
             branch_choice,
+            relocated: false,
         }
     }
 }
@@ -783,5 +875,76 @@ mod tests {
         assert!(matches!(t.committed_state, TrackState::AtBranch { .. }));
         t.reset();
         assert_eq!(t.position(), 0);
+    }
+
+    fn long_script(n: usize) -> Script {
+        let sentences: Vec<Sentence> = (0..n)
+            .map(|i| sent(&format!("{} {} {} {} {} {}", w(i, 0), w(i, 1), w(i, 2), w(i, 3), w(i, 4), w(i, 5))))
+            .collect();
+        script_from(vec![Section {
+            name: "Body".into(),
+            word_count: 0,
+            elements: vec![Element::Text(sentences)],
+        }])
+    }
+
+    /// A distinct, deterministic word per (sentence, slot).
+    fn w(i: usize, k: usize) -> String {
+        const SYL: [&str; 12] = ["ka", "lo", "mi", "ne", "pu", "ra", "si", "to", "vu", "ze", "bo", "di"];
+        format!("{}{}{}", SYL[i % 12], SYL[(i / 12 + k) % 12], SYL[(k * 5 + i) % 12])
+    }
+
+    fn sentence_text(i: usize) -> String {
+        (0..6).map(|k| w(i, k)).collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn relocator_follows_a_real_skip_after_agreement() {
+        let mut t = ScriptTracker::new(&long_script(40));
+        t.set_window_radius(5);
+        t.observe(&SpeechUpdate::partial(sentence_text(0)));
+        assert_eq!(t.preview_position(), 0);
+        // The reader skips to sentence 30 and keeps reading there.
+        let mut moved = None;
+        for i in 30..34 {
+            let u = t.observe(&SpeechUpdate::partial(sentence_text(i)));
+            if u.relocated {
+                moved = Some(u.sentence_index);
+                break;
+            }
+        }
+        let at = moved.expect("relocator should move after agreement");
+        assert!((30..=33).contains(&at), "relocated to {at}");
+    }
+
+    #[test]
+    fn relocator_ignores_a_single_far_coincidence() {
+        let mut t = ScriptTracker::new(&long_script(40));
+        t.set_window_radius(5);
+        t.observe(&SpeechUpdate::partial(sentence_text(0)));
+        // One far phrase, then back to reading locally.
+        let u = t.observe(&SpeechUpdate::partial(sentence_text(30)));
+        assert!(!u.relocated);
+        t.observe(&SpeechUpdate::partial(sentence_text(1)));
+        let u = t.observe(&SpeechUpdate::partial(sentence_text(30)));
+        assert!(!u.relocated, "agreement must be consecutive and progressing");
+        assert!(t.preview_position() <= 2);
+    }
+
+    #[test]
+    fn relocator_can_go_back_to_reread() {
+        let mut t = ScriptTracker::new(&long_script(40));
+        t.set_window_radius(5);
+        t.set_position(30);
+        let mut moved = None;
+        for i in 5..9 {
+            let u = t.observe(&SpeechUpdate::partial(sentence_text(i)));
+            if u.relocated {
+                moved = Some(u.sentence_index);
+                break;
+            }
+        }
+        let at = moved.expect("relocator should follow a re-read");
+        assert!((5..=8).contains(&at));
     }
 }

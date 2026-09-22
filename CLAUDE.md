@@ -43,7 +43,10 @@ Cargo workspace with two crates:
 ### `prompter-core` (library)
 Pure-logic crate with no Tauri dependency. Feature-gated audio:
 - **`script.rs`** — Parses `.script.md` format (YAML frontmatter + annotated markdown). Splits body into `Section > Element > Sentence`. Handles variable substitution, PAUSE/BRANCH directives.
-- **`align.rs`** — Fuzzy text alignment engine. Matches Whisper transcription output against script sentences using bigram similarity (Dice coefficient) over a sliding window around the cursor position.
+- **`align.rs`** — Word-level alignment engine: a bounded, monotonic local DP over words around the cursor, with sound-alike matching for misheard drug names ("metro pro law" → metoprolol) and split/joined words. `locate_global` searches the whole script for the tracker's relocator.
+- **`tracker.rs`** — `ScriptTracker`: drives the aligner from partial/final speech updates, handles pause/branch state, and runs the whole-script relocator (moves the cursor far only after 3 progressing agreements).
+- **`session.rs`** — `SessionRecorder`: speech-verified coverage, transcript, repeats and off-script stretches; accepts the post-session re-alignment.
+- **`realign.rs`** — Post-session pass: global word alignment of the full-recording transcript against the whole script (per-sentence delivered / omitted, off-script words).
 - **`compliance.rs`** — Generates post-session reports (sections covered, time per section, adherence %, branch decisions). Writes markdown files to `~/meetings/consults/` with 0600 permissions.
 - **`coaching.rs`** — Data-driven delivery analysis (no LLM). Analyzes pacing, coverage, pause discipline, section balance. Produces severity-ranked insights.
 - **`transcribe.rs`** — Streaming Whisper wrapper (Tier 2). Keeps WhisperContext alive across audio chunks to avoid model reload penalty. Feature-gated behind `whisper`.
@@ -61,7 +64,9 @@ Desktop shell. Converts core types to JSON-serializable structs for the frontend
 - `set_always_on_top` — Window management
 - Deep link handling (`prompter://open?file=...` or `prompter://open?consultation_id=...`)
 
-The audio thread runs a loop: cpal → VAD (Tier 1, ~10Hz) → optional Whisper transcription on silence boundaries (Tier 2) → alignment correction. Events emitted to frontend: `vad`, `align`, `tier2-ready`, `audio-started`, `vad-error`.
+Live speech comes from the Swift helper `scripts/speech-recognizer.swift` (Apple on-device Speech), bundled next to the app binary. Per session it gets `--script` (builds a custom language model from the script's spoken lines, macOS 14+), `--record` (16 kHz CAF for verification), and optionally `--system-audio` (ScreenCaptureKit call audio → `{"other": bool}`). After the session, `finish_tracking` writes the live report, then a background pass runs the helper in `--file` mode on the recording, re-aligns it (`realign.rs`), rewrites the report, deletes the audio (unless `keep_session_audio`), and emits `verification-complete`. Events: `speech`, `track-update`, `other-party`, `speech-status`, `speech-error` (fatal → timer fallback), `speech-warning` (non-fatal), `verification-complete` / `verification-failed`.
+
+The helper only has speech permission when launched by Prompter.app; running it from a terminal reports `speech_auth_not_determined`.
 
 ### UI (`crates/app/ui/index.html`)
 Single-file vanilla JS/HTML/CSS. No framework, no build step. Communicates with Rust via `window.__TAURI__.core.invoke()` and `window.__TAURI__.event.listen()`.

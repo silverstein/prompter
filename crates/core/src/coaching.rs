@@ -28,6 +28,8 @@ pub enum InsightCategory {
     PausePoints,
     Balance,
     Overall,
+    Delivery,
+    Interaction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -46,6 +48,9 @@ pub fn analyze(report: &ComplianceReport) -> Vec<Insight> {
     analyze_pacing(report, &mut insights);
     analyze_pauses(report, &mut insights);
     analyze_balance(report, &mut insights);
+    analyze_speaking_pace(report, &mut insights);
+    analyze_miscues(report, &mut insights);
+    analyze_interaction(report, &mut insights);
     analyze_overall(report, &mut insights);
 
     // Sort: critical first, praise last
@@ -171,6 +176,129 @@ fn analyze_pacing(report: &ComplianceReport, insights: &mut Vec<Insight>) {
     }
 }
 
+/// Comfortable counselling pace, in words per minute. PowerPoint Speaker Coach
+/// treats 100-165 wpm as a good presenting rate; patient counselling should sit
+/// in (and ideally toward the slower half of) that band.
+const PACE_SLOW_WPM: f32 = 100.0;
+const PACE_FAST_WPM: f32 = 165.0;
+
+fn analyze_speaking_pace(report: &ComplianceReport, insights: &mut Vec<Insight>) {
+    let d = &report.delivery;
+    if let Some(wpm) = d.speaking_wpm {
+        if wpm > PACE_FAST_WPM {
+            insights.push(Insight {
+                category: InsightCategory::Pacing,
+                severity: Severity::Warning,
+                message: format!("You spoke at {:.0} words per minute.", wpm),
+                advice: format!(
+                    "That's above the comfortable {:.0}-{:.0} range. Slow down around drug names and instructions.",
+                    PACE_SLOW_WPM, PACE_FAST_WPM
+                ),
+            });
+        } else if wpm < PACE_SLOW_WPM {
+            insights.push(Insight {
+                category: InsightCategory::Pacing,
+                severity: Severity::Info,
+                message: format!("You spoke at {:.0} words per minute.", wpm),
+                advice: "Slower than typical. Fine if deliberate; check you aren't losing the patient's attention.".into(),
+            });
+        } else {
+            insights.push(Insight {
+                category: InsightCategory::Pacing,
+                severity: Severity::Praise,
+                message: format!("Comfortable pace: {:.0} words per minute.", wpm),
+                advice: "Right in the range patients can follow.".into(),
+            });
+        }
+        return;
+    }
+    // No speaking-time measurement: overall words per minute includes listening
+    // time, so it can only tell us when delivery was clearly rushed.
+    if report.duration_secs >= 60 && report.words_delivered > 0 {
+        let overall = report.words_delivered as f32 / (report.duration_secs as f32 / 60.0);
+        if overall > PACE_FAST_WPM {
+            insights.push(Insight {
+                category: InsightCategory::Pacing,
+                severity: Severity::Warning,
+                message: format!("Overall pace was {:.0} words per minute, including pauses.", overall),
+                advice: "Even counting pauses that's fast. Give the patient time to take things in.".into(),
+            });
+        }
+    }
+}
+
+fn analyze_miscues(report: &ComplianceReport, insights: &mut Vec<Insight>) {
+    let d = &report.delivery;
+    // Omissions: only worth calling out line by line when the section itself was
+    // covered (whole skipped sections are already reported under Coverage).
+    if !d.omitted_lines.is_empty() && !report.sections_covered.is_empty() {
+        let shown: Vec<String> = d
+            .omitted_lines
+            .iter()
+            .take(3)
+            .map(|l| format!("\"{}\"", l))
+            .collect();
+        let more = d.omitted_lines.len().saturating_sub(3);
+        insights.push(Insight {
+            category: InsightCategory::Delivery,
+            severity: if d.verified_by_recording { Severity::Warning } else { Severity::Info },
+            message: format!(
+                "{} line{} not delivered: {}{}.",
+                d.omitted_lines.len(),
+                if d.omitted_lines.len() == 1 { "" } else { "s" },
+                shown.join(", "),
+                if more > 0 { format!(" and {more} more") } else { String::new() }
+            ),
+            advice: if d.verified_by_recording {
+                "Confirmed against the full recording. Check none of these were required.".into()
+            } else {
+                "From live tracking only; some may have been said but not recognized.".into()
+            },
+        });
+    }
+    if d.repeats >= 3 {
+        insights.push(Insight {
+            category: InsightCategory::Delivery,
+            severity: Severity::Info,
+            message: format!("You went back to restart a line {} times.", d.repeats),
+            advice: "Those spots may be worth rehearsing, or rewording in the script.".into(),
+        });
+    }
+    if d.off_script_episodes >= 3 {
+        insights.push(Insight {
+            category: InsightCategory::Delivery,
+            severity: Severity::Info,
+            message: format!("{} stretches of off-script speech.", d.off_script_episodes),
+            advice: "Normal in a real conversation. If they cluster in one section, the script may need a better line there.".into(),
+        });
+    }
+}
+
+/// A comprehensive medication review must be an interactive consultation (CMS).
+/// With call audio captured separately we can show the patient took part.
+fn analyze_interaction(report: &ComplianceReport, insights: &mut Vec<Insight>) {
+    let Some(patient) = report.delivery.patient_talk_secs else { return };
+    if report.duration_secs < 120 {
+        return;
+    }
+    let share = patient as f32 / report.duration_secs as f32;
+    if share < 0.10 {
+        insights.push(Insight {
+            category: InsightCategory::Interaction,
+            severity: Severity::Warning,
+            message: format!("The patient spoke for {} ({:.0}% of the session).", fmt_duration(patient), share * 100.0),
+            advice: "CMRs must be interactive. Use the pause points to invite questions.".into(),
+        });
+    } else if share >= 0.20 {
+        insights.push(Insight {
+            category: InsightCategory::Interaction,
+            severity: Severity::Praise,
+            message: format!("The patient spoke for {} ({:.0}% of the session).", fmt_duration(patient), share * 100.0),
+            advice: "A genuinely two-way consultation.".into(),
+        });
+    }
+}
+
 fn analyze_pauses(report: &ComplianceReport, insights: &mut Vec<Insight>) {
     if report.pause_points_total == 0 { return; }
 
@@ -266,6 +394,7 @@ mod tests {
             branches_taken: HashMap::from([("Question?".into(), "YES".into())]),
             total_words: 2000,
             words_delivered: 1800,
+            ..Default::default()
         }
     }
 
@@ -303,5 +432,25 @@ mod tests {
         let md = coaching_markdown(&report);
         assert!(md.contains("# Delivery Coaching"));
         assert!(md.contains("What went well"));
+    }
+
+    #[test]
+    fn fast_speaking_pace_is_flagged_and_normal_is_praised() {
+        let mut r = sample_report();
+        r.delivery.speaking_wpm = Some(190.0);
+        assert!(analyze(&r).iter().any(|i| i.category == InsightCategory::Pacing && i.severity == Severity::Warning));
+        r.delivery.speaking_wpm = Some(130.0);
+        assert!(analyze(&r).iter().any(|i| i.category == InsightCategory::Pacing && i.severity == Severity::Praise));
+    }
+
+    #[test]
+    fn omitted_lines_and_low_patient_talk_are_reported() {
+        let mut r = sample_report();
+        r.delivery.omitted_lines = vec!["garlic extract can thin your blood".into()];
+        r.delivery.verified_by_recording = true;
+        r.delivery.patient_talk_secs = Some(30);
+        let ins = analyze(&r);
+        assert!(ins.iter().any(|i| i.category == InsightCategory::Delivery && i.severity == Severity::Warning));
+        assert!(ins.iter().any(|i| i.category == InsightCategory::Interaction && i.severity == Severity::Warning));
     }
 }

@@ -6,7 +6,10 @@ export CXXFLAGS="-I$(xcrun --show-sdk-path)/usr/include/c++/v1"
 export MACOSX_DEPLOYMENT_TARGET="13.0"
 
 echo "=== Building speech recognizer (Swift) ==="
-swiftc -O scripts/speech-recognizer.swift -o target/speech-recognizer
+mkdir -p target
+# Target the app's minimum macOS (13) so the helper runs on older Macs too;
+# newer features (custom language model: macOS 14) are guarded at runtime.
+swiftc -O -target "$(uname -m)-apple-macos13.0" scripts/speech-recognizer.swift -o target/speech-recognizer
 echo "  Built target/speech-recognizer"
 
 echo "=== Building Tauri app ==="

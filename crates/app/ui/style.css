@@ -195,6 +195,9 @@
   .help-card h3{margin-bottom:18px;font-size:15px;font-weight:600}
   .help-card table{width:100%;font-size:13px;border-spacing:0}
   .help-card td{padding:5px 0;color:var(--text-secondary)}
+  .help-card .opt{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;font-size:13px;color:var(--text-secondary);padding:5px 0;cursor:pointer}
+  .help-card .opt input{accent-color:var(--green)}
+  .help-card .opt-note{flex-basis:100%;padding-left:22px;font-size:11px;color:var(--text-muted)}
   .help-card td:first-child{color:var(--text);font-family:ui-monospace,monospace;width:72px;font-size:12px}
 
   /* ── Recent scripts ── */
