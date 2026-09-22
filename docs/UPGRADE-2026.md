@@ -212,6 +212,33 @@ Deferred follow-ups (do NOT bite a normal linear read; tracked, not fixed):
   still points at the preceding sentence; the speech-mode UI currently highlights by sentence index
   and does not render the cue, so pauses/branches are not yet shown live during a spoken read.
 
+## 6b. September 2026 additions (from the adjacent-fields research)
+
+See the research write-up (teleprompters, reading tutors, opera score following, streaming ASR,
+contact-center copilots, audiobook proofing). Built on branch `sota-upgrades-2026-09`:
+
+- **Per-script custom language model** (`SFCustomLanguageModelData`, macOS 14+): the helper is
+  handed the script's spoken lines (variables substituted, pause questions, branch options) and
+  biases recognition toward them. Prepare takes <1 s.
+- **Post-session verification**: the session is recorded (16 kHz CAF, 0600, in a 0700 per-session
+  folder), re-transcribed after the session, and globally aligned against the script
+  (`realign.rs`). Coverage in the report then comes from the full recording; the live tracker only
+  drives the scroll. Audio is deleted afterward unless `keep_session_audio` is on.
+- **Sound-alike and split-word matching** in the aligner (drug names heard as several words).
+- **Whole-script relocator** in the tracker (opera score-following two-tier design): recovers a
+  real skip or a jump back only after 3 successive, progressing agreements at ≥5 words / 0.8 density.
+- **Call audio** (`detect_other_party`, off by default): ScreenCaptureKit system audio marks when
+  the patient is speaking; their speech can't steer the cursor, the UI shows "Patient speaking" and
+  a silence-based end of turn at pause points, and patient talk time feeds an interaction check
+  (CMRs must be interactive).
+- **Coaching**: speaking pace against the 100–165 wpm band (from recording word timings), lines not
+  delivered, restarts, off-script stretches (Reading Progress-style miscue categories).
+- **Re-anchor**: arrow keys / section jumps now move the tracker too, not just the highlight.
+
+Not built: a learned end-of-turn model (Pipecat Smart Turn). It needs an ONNX runtime and model in
+the app; the silence-based end of turn on the call-audio stream covers the pause-point case for now.
+Enrolled-voice speaker verification for in-person consults is also still open.
+
 ## 7. References (selected, from the 2026 SOTA research)
 
 - Open ASR Leaderboard: arXiv 2510.06961. Whisper is batch-by-construction: gladia.io/blog/what-is-openai-whisper.

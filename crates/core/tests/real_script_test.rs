@@ -124,3 +124,68 @@ fn word_count_realistic() {
         println!("  {} — {} words", section.name, section.word_count);
     }
 }
+
+/// Simulate Apple's recognizer on a full read of the real MTM script: one
+/// cumulative partial per word, never a final. The cursor must reach the last
+/// main sentence, never jump more than one sentence at a time, and never go back.
+#[test]
+fn simulated_full_read_tracks_to_the_end_without_jumps() {
+    use prompter_core::{recent_words, ScriptTracker, SpeechUpdate, TimelineStep};
+    let script = script::parse(MTM_SCRIPT).unwrap();
+    let mut tracker = ScriptTracker::new(&script);
+    tracker.set_window_radius(10);
+    let main: Vec<String> = tracker
+        .timeline()
+        .iter()
+        .filter_map(|s| match s {
+            TimelineStep::Sentence { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut spoken = String::new();
+    let mut last = 0usize;
+    for sentence in &main {
+        for word in sentence.split_whitespace() {
+            spoken.push(' ');
+            spoken.push_str(word);
+            let u = tracker.observe(&SpeechUpdate::partial(recent_words(&spoken, 10)));
+            assert!(u.sentence_index >= last, "went back {} -> {}", last, u.sentence_index);
+            assert!(u.sentence_index <= last + 1, "jumped {} -> {} on {:?}", last, u.sentence_index, recent_words(&spoken, 10));
+            last = u.sentence_index;
+        }
+    }
+    assert!(last + 1 >= main.len(), "reached {last} of {}", main.len());
+}
+
+/// A real skip of many sentences mid-read is followed (via the relocator or
+/// the capped local catch-up), and lands on the sentence being read.
+#[test]
+fn simulated_skip_is_followed() {
+    use prompter_core::{recent_words, ScriptTracker, SpeechUpdate, TimelineStep};
+    let script = script::parse(MTM_SCRIPT).unwrap();
+    let mut tracker = ScriptTracker::new(&script);
+    tracker.set_window_radius(10);
+    let main: Vec<String> = tracker
+        .timeline()
+        .iter()
+        .filter_map(|s| match s {
+            TimelineStep::Sentence { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(main.len() > 30, "fixture should be long");
+    let skip_to = main.len() - 8;
+    let mut spoken = String::new();
+    for i in (0..3).chain(skip_to..skip_to + 3) {
+        for word in main[i].split_whitespace() {
+            spoken.push(' ');
+            spoken.push_str(word);
+            tracker.observe(&SpeechUpdate::partial(recent_words(&spoken, 10)));
+        }
+    }
+    let at = tracker.preview_position();
+    assert!(
+        (skip_to..=skip_to + 2).contains(&at),
+        "expected to follow the skip to ~{skip_to}, cursor at {at}"
+    );
+}

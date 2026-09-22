@@ -9,7 +9,8 @@
 //! which pause points were reached, and the recognized transcript (which the
 //! prior pipeline never persisted). See `docs/UPGRADE-2026.md`, D6.
 
-use crate::compliance::ComplianceReport;
+use crate::compliance::{ComplianceReport, DeliveryStats};
+use crate::realign::Realignment;
 use crate::script::{Directive, Element, Script};
 use crate::tracker::{TrackState, TrackUpdate};
 use std::collections::{HashMap, HashSet};
@@ -47,7 +48,24 @@ pub struct SessionRecorder {
     /// Highest main sentence already written to the transcript, so partial
     /// evidence adds one line per sentence reached instead of one per partial.
     last_transcript_sentence: Option<usize>,
+    /// Text of each main sentence (for "lines not delivered" excerpts).
+    sentence_text: Vec<String>,
+    /// Last sentence with match evidence (to spot going back to re-read).
+    last_matched: Option<usize>,
+    repeats: usize,
+    off_script_episodes: usize,
+    in_off_script: bool,
+    /// Set by [`Self::apply_realignment`] / [`Self::set_timing`].
+    off_script_words: Option<usize>,
+    speaking_wpm: Option<f32>,
+    patient_talk_secs: Option<u64>,
+    verified_by_recording: bool,
 }
+
+/// Longest excerpt used for an omitted line in the report.
+const EXCERPT_WORDS: usize = 10;
+/// Most omitted lines listed in a report.
+const MAX_OMITTED_LISTED: usize = 12;
 
 impl SessionRecorder {
     /// Build a recorder for a script.
@@ -57,6 +75,7 @@ impl SessionRecorder {
         let mut section_names = Vec::new();
         let mut pause_total = 0usize;
         let mut total_words = 0usize;
+        let mut sentence_text = Vec::new();
 
         for (section_index, section) in script.sections.iter().enumerate() {
             section_names.push(section.name.clone());
@@ -69,6 +88,7 @@ impl SessionRecorder {
                         for sentence in sentences {
                             sentence_section.push(section_index);
                             sentence_words.push(sentence.word_count);
+                            sentence_text.push(sentence.text.clone());
                             total_words += sentence.word_count;
                         }
                         prev_was_main = !sentences.is_empty();
@@ -107,6 +127,15 @@ impl SessionRecorder {
             branches_taken: HashMap::new(),
             transcript: Vec::new(),
             last_transcript_sentence: None,
+            sentence_text,
+            last_matched: None,
+            repeats: 0,
+            off_script_episodes: 0,
+            in_off_script: false,
+            off_script_words: None,
+            speaking_wpm: None,
+            patient_talk_secs: None,
+            verified_by_recording: false,
         }
     }
 
@@ -118,8 +147,26 @@ impl SessionRecorder {
     /// Gating on `committed` alone left the compliance report empty for an
     /// entire read. Unmatched, non-committed updates still carry nothing.
     pub fn record(&mut self, update: &TrackUpdate, recognized: &str) {
+        // Off-script stretches: count each entry into the ad-lib state once.
+        let off = matches!(update.state, TrackState::AdLibbing);
+        if off && !self.in_off_script {
+            self.off_script_episodes += 1;
+        }
+        if update.matched || off {
+            self.in_off_script = off;
+        }
         if !update.matched && !update.committed {
             return;
+        }
+        // Going back to an earlier line (a restart / re-read) counts once per
+        // backward move.
+        if update.matched {
+            if let Some(prev) = self.last_matched {
+                if update.sentence_index < prev {
+                    self.repeats += 1;
+                }
+            }
+            self.last_matched = Some(update.sentence_index);
         }
 
         // Coverage / pause evidence counts ONLY on a real match (partial or
@@ -229,6 +276,70 @@ impl SessionRecorder {
             branches_taken: self.branches_taken.clone(),
             total_words: self.total_words,
             words_delivered: self.words_delivered(),
+            delivery: self.delivery_stats(),
+        }
+    }
+
+    /// Replace live coverage with the full-recording re-alignment. The recording
+    /// is authoritative when it holds a real read; a near-empty recording (mic
+    /// failure, a 5-second session) is ignored so it can't wipe live evidence.
+    /// Returns whether it was applied.
+    pub fn apply_realignment(&mut self, r: &Realignment) -> bool {
+        if r.covered.len() != self.covered.len() {
+            return false;
+        }
+        // A fifth of the script, at least 10 words (but never more than half a
+        // very short script).
+        let min_words = (self.total_words / 5).max(10).min(self.total_words / 2).max(1);
+        if r.matched_words < min_words {
+            return false;
+        }
+        self.covered = r.covered.clone();
+        self.off_script_words = Some(r.inserted_words);
+        self.verified_by_recording = true;
+        true
+    }
+
+    /// Timing facts measured outside the tracker: speaking pace (from the
+    /// recording's word timings) and patient talk time (from call audio).
+    pub fn set_timing(&mut self, speaking_wpm: Option<f32>, patient_talk_secs: Option<u64>) {
+        if speaking_wpm.is_some() {
+            self.speaking_wpm = speaking_wpm;
+        }
+        if patient_talk_secs.is_some() {
+            self.patient_talk_secs = patient_talk_secs;
+        }
+    }
+
+    /// Main-line sentence texts, in order (what the re-alignment runs against).
+    pub fn sentences(&self) -> &[String] {
+        &self.sentence_text
+    }
+
+    fn delivery_stats(&self) -> DeliveryStats {
+        let omitted_lines = self
+            .covered
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| !c)
+            .take(MAX_OMITTED_LISTED)
+            .map(|(i, _)| {
+                let words: Vec<&str> = self.sentence_text[i].split_whitespace().collect();
+                let mut e = words[..words.len().min(EXCERPT_WORDS)].join(" ");
+                if words.len() > EXCERPT_WORDS {
+                    e.push('…');
+                }
+                e
+            })
+            .collect();
+        DeliveryStats {
+            omitted_lines,
+            repeats: self.repeats,
+            off_script_episodes: self.off_script_episodes,
+            off_script_words: self.off_script_words,
+            speaking_wpm: self.speaking_wpm,
+            patient_talk_secs: self.patient_talk_secs,
+            verified_by_recording: self.verified_by_recording,
         }
     }
 
@@ -433,5 +544,48 @@ mod tests {
             rec.record(&u, text);
         }
         assert_eq!(rec.transcript().len(), 1);
+    }
+
+    #[test]
+    fn repeats_and_off_script_are_counted_once_per_event() {
+        use crate::tracker::{TrackState, TrackUpdate};
+        let script = crate::script::parse("# A\n\nOne two three four. Five six seven eight. Nine ten eleven twelve.\n").unwrap();
+        let mut rec = SessionRecorder::new(&script);
+        let up = |i: usize, state: TrackState, matched: bool| TrackUpdate {
+            sentence_index: i,
+            timeline_index: i + 1,
+            committed: true,
+            matched,
+            confidence: 1.0,
+            state,
+            branch_choice: None,
+            relocated: false,
+        };
+        rec.record(&up(0, TrackState::Speaking, true), "one two");
+        rec.record(&up(2, TrackState::Speaking, true), "nine ten");
+        rec.record(&up(1, TrackState::Speaking, true), "five six"); // went back
+        rec.record(&up(2, TrackState::Speaking, true), "nine ten");
+        rec.record(&up(2, TrackState::AdLibbing, false), "blah");
+        rec.record(&up(2, TrackState::AdLibbing, false), "blah blah");
+        rec.record(&up(2, TrackState::Speaking, true), "eleven twelve");
+        let d = rec.build_report(60).delivery;
+        assert_eq!(d.repeats, 1);
+        assert_eq!(d.off_script_episodes, 1);
+    }
+
+    #[test]
+    fn realignment_replaces_live_coverage_only_with_a_real_recording() {
+        let script = crate::script::parse("# A\n\nOne two three four. Five six seven eight. Nine ten eleven twelve.\n").unwrap();
+        let mut rec = SessionRecorder::new(&script);
+        let tiny = crate::realign::realign(rec.sentences(), "one two");
+        assert!(!rec.apply_realignment(&tiny), "too little to trust");
+        let full = crate::realign::realign(
+            rec.sentences(),
+            "one two three four nine ten eleven twelve",
+        );
+        assert!(rec.apply_realignment(&full));
+        let r = rec.build_report(60);
+        assert!(r.delivery.verified_by_recording);
+        assert_eq!(r.delivery.omitted_lines, vec!["Five six seven eight.".to_string()]);
     }
 }

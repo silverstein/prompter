@@ -2,12 +2,13 @@
 
 use prompter_core::script::{self, Directive, Element};
 use prompter_core::{
-    recent_words, ScriptTracker, SessionRecorder, SpeechUpdate, TrackState, TrackUpdate,
+    realign, recent_words, write_private, ScriptTracker, SessionRecorder, SpeechUpdate,
+    TrackState, TrackUpdate,
 };
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{Emitter, Manager};
@@ -123,6 +124,47 @@ static AUDIO_RUNNING: AtomicBool = AtomicBool::new(false);
 // Use a lazy-initialized Arc<AtomicBool> for the stop signal
 static AUDIO_STOP: std::sync::LazyLock<Arc<AtomicBool>> =
     std::sync::LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+/// PID of the running speech helper (0 = none), so stop can signal it directly
+/// instead of waiting for its next output line.
+static SPEECH_PID: AtomicU32 = AtomicU32::new(0);
+/// True while the other party (call audio) is speaking.
+static OTHER_SPEAKING: AtomicBool = AtomicBool::new(false);
+
+/// Ask the speech helper to stop cleanly (SIGTERM lets it close the recording).
+fn signal_speech_helper() {
+    let pid = SPEECH_PID.load(Ordering::SeqCst);
+    if pid != 0 {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+}
+
+/// Path of the bundled speech helper (next to the app binary).
+fn speech_helper_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_default()
+        .join("speech-recognizer")
+}
+
+/// Create a private per-session folder under ~/.prompter/sessions.
+fn new_session_dir() -> Option<std::path::PathBuf> {
+    let home = dirs_next::home_dir()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let dir = home.join(".prompter").join("sessions").join(stamp.to_string());
+    fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
+    Some(dir)
+}
 
 // ── Tauri commands ──
 
@@ -153,6 +195,12 @@ struct TrackingSession {
     started: Instant,
     /// Where the raw ASR stream is logged for offline replay (None if disabled).
     recording: Option<std::path::PathBuf>,
+    /// Private per-session folder: the script copy (for the custom language
+    /// model) and the audio recording (for the post-session verification pass).
+    session_dir: Option<std::path::PathBuf>,
+    /// Seconds the other party was heard speaking (call audio), if watched.
+    patient_talk_secs: f64,
+    watched_other_party: bool,
 }
 
 #[derive(Default)]
@@ -172,6 +220,7 @@ struct TrackEvent {
     option_label: Option<String>,
     branch_question: Option<String>,
     selected_option: Option<String>,
+    relocated: bool,
 }
 
 fn track_event(u: &TrackUpdate) -> TrackEvent {
@@ -202,6 +251,7 @@ fn track_event(u: &TrackUpdate) -> TrackEvent {
         option_label,
         branch_question: u.branch_choice.as_ref().map(|c| c.question.clone()),
         selected_option: u.branch_choice.as_ref().map(|c| c.option_label.clone()),
+        relocated: u.relocated,
     }
 }
 
@@ -233,19 +283,77 @@ fn init_tracking(state: tauri::State<TrackingState>, text: String) -> Result<(),
         let header = serde_json::json!({ "type": "script", "source": text }).to_string();
         fs::write(&path, format!("{header}\n")).ok().map(|_| path)
     };
+    let session_dir = new_session_dir();
+    if let Some(dir) = &session_dir {
+        // The language model learns what will actually be said: sentences with
+        // variables filled in (drug names, not "{{supplements}}"), pause
+        // questions, and every branch option. One phrase per line.
+        let _ = write_private(&dir.join("script.md"), &spoken_phrases(&parsed));
+    }
+    OTHER_SPEAKING.store(false, Ordering::SeqCst);
     *slot = Some(TrackingSession {
         tracker,
         recorder: SessionRecorder::new(&parsed),
         started: Instant::now(),
         recording,
+        session_dir,
+        patient_talk_secs: 0.0,
+        watched_other_party: false,
     });
     Ok(())
+}
+
+/// Every line the speaker may say, variables substituted, one per line.
+fn spoken_phrases(parsed: &script::Script) -> String {
+    let mut out = String::new();
+    for section in &parsed.sections {
+        for element in &section.elements {
+            match element {
+                Element::Text(sentences) => {
+                    for s in sentences {
+                        out.push_str(&s.text);
+                        out.push('\n');
+                    }
+                }
+                Element::Directive(Directive::Pause { prompt }) => {
+                    out.push_str(prompt);
+                    out.push('\n');
+                }
+                Element::Directive(Directive::Branch { question, options }) => {
+                    out.push_str(question);
+                    out.push('\n');
+                    for o in options {
+                        for s in &o.sentences {
+                            out.push_str(&s.text);
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Manual navigation (arrow keys, section jump): re-anchor the tracker so the
+/// next recognized speech is matched from where the speaker says they are. The
+/// one-key "I'm here" override every tracking system keeps.
+#[tauri::command]
+fn set_tracking_position(state: tauri::State<TrackingState>, sentence_index: usize) {
+    if let Ok(mut slot) = state.0.lock() {
+        if let Some(s) = slot.as_mut() {
+            s.tracker.set_position(sentence_index);
+        }
+    }
 }
 
 /// Clear the tracking session (e.g. on reset), so a stale tracker cannot mis-track.
 #[tauri::command]
 fn clear_tracking(state: tauri::State<TrackingState>) {
     if let Ok(mut slot) = state.0.lock() {
+        if let Some(dir) = slot.as_ref().and_then(|s| s.session_dir.clone()) {
+            let _ = fs::remove_dir_all(dir);
+        }
         *slot = None;
     }
 }
@@ -266,39 +374,38 @@ struct ComplianceOut {
     adherence_pct: f64,
     saved_path: String,
     transcript_markdown: String,
+    /// Coaching computed from the full report (including delivery stats).
+    coaching: Vec<CoachingInsight>,
+    /// True when coverage was confirmed against the full recording.
+    verified_by_recording: bool,
+    /// True when a verification pass is running; a `verification-complete`
+    /// (or `verification-failed`) event follows.
+    verifying: bool,
 }
 
-/// Finish the tracking session: build the speech-verified compliance report,
-/// write it (and the transcript) to disk, and return it.
-#[tauri::command]
-fn finish_tracking(
-    state: tauri::State<TrackingState>,
-    duration_secs: u64,
-    section_times: HashMap<String, u64>,
-) -> Result<ComplianceOut, String> {
-    // Take (and clear) the session, then release the lock before disk I/O so the
-    // speech reader is never blocked and a stale session can't leak forward.
-    let session = {
-        let mut slot = state.0.lock().map_err(|_| "tracking state poisoned")?;
-        slot.take()
-    }
-    .ok_or("no active tracking session (call init_tracking first)")?;
+fn coaching_out(report: &prompter_core::ComplianceReport) -> Vec<CoachingInsight> {
+    prompter_core::coaching::analyze(report)
+        .into_iter()
+        .map(|i| CoachingInsight {
+            severity: match i.severity {
+                prompter_core::coaching::Severity::Praise => "praise".into(),
+                prompter_core::coaching::Severity::Info => "info".into(),
+                prompter_core::coaching::Severity::Warning => "warning".into(),
+                prompter_core::coaching::Severity::Critical => "critical".into(),
+            },
+            message: i.message,
+            advice: i.advice,
+        })
+        .collect()
+}
 
-    let mut report = session.recorder.build_report(duration_secs);
-    // The recorder has no clock; the UI supplies per-section timing.
-    report.section_times = section_times;
-    let transcript = session.recorder.transcript_markdown();
-
-    let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let dir = home.join("meetings").join("consults");
-    let path = report
-        .write_to_dir(&dir)
-        .map_err(|e| format!("Failed to save compliance report: {}", e))?;
-    // Best-effort transcript artifact next to the report.
-    let transcript_path = path.with_extension("transcript.md");
-    let _ = fs::write(&transcript_path, &transcript);
-
-    Ok(ComplianceOut {
+fn compliance_out(
+    report: &prompter_core::ComplianceReport,
+    saved_path: &std::path::Path,
+    transcript: String,
+    verifying: bool,
+) -> ComplianceOut {
+    ComplianceOut {
         script_title: report.script_title.clone(),
         script_version: report.script_version.clone(),
         sections_covered: report.sections_covered.clone(),
@@ -310,50 +417,207 @@ fn finish_tracking(
         total_words: report.total_words,
         words_delivered: report.words_delivered,
         adherence_pct: report.adherence_pct(),
-        saved_path: path.to_string_lossy().to_string(),
+        saved_path: saved_path.to_string_lossy().to_string(),
         transcript_markdown: transcript,
-    })
+        coaching: coaching_out(report),
+        verified_by_recording: report.delivery.verified_by_recording,
+        verifying,
+    }
+}
+
+/// Finish the tracking session: build the speech-verified compliance report,
+/// write it (and the transcript) to disk, and return it. If the session was
+/// recorded, a background pass then re-transcribes the whole recording, aligns
+/// it against the script, rewrites the report, and emits
+/// `verification-complete`.
+#[tauri::command]
+fn finish_tracking(
+    app: tauri::AppHandle,
+    state: tauri::State<TrackingState>,
+    duration_secs: u64,
+    section_times: HashMap<String, u64>,
+) -> Result<ComplianceOut, String> {
+    // Take (and clear) the session, then release the lock before disk I/O so the
+    // speech reader is never blocked and a stale session can't leak forward.
+    let mut session = {
+        let mut slot = state.0.lock().map_err(|_| "tracking state poisoned")?;
+        slot.take()
+    }
+    .ok_or("no active tracking session (call init_tracking first)")?;
+
+    let patient_secs = session
+        .watched_other_party
+        .then_some(session.patient_talk_secs.round() as u64);
+    session.recorder.set_timing(None, patient_secs);
+    let mut report = session.recorder.build_report(duration_secs);
+    // The recorder has no clock; the UI supplies per-section timing.
+    report.section_times = section_times.clone();
+    let transcript = session.recorder.transcript_markdown();
+
+    let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = home.join("meetings").join("consults");
+    let path = report
+        .write_to_dir(&dir)
+        .map_err(|e| format!("Failed to save compliance report: {}", e))?;
+    // Best-effort transcript artifact next to the report (0600: patient speech).
+    let _ = write_private(&path.with_extension("transcript.md"), &transcript);
+
+    let audio = session
+        .session_dir
+        .as_ref()
+        .map(|d| d.join("audio.caf"))
+        .filter(|a| a.exists());
+    let verifying = audio.is_some();
+    let out = compliance_out(&report, &path, transcript.clone(), verifying);
+
+    match audio {
+        Some(audio) => {
+            let session_dir = session.session_dir.clone();
+            std::thread::spawn(move || {
+                let result = verify_with_recording(&mut session, &audio, duration_secs, &section_times, &path);
+                if !load_settings().keep_session_audio {
+                    if let Some(d) = session_dir {
+                        let _ = fs::remove_dir_all(d);
+                    }
+                }
+                match result {
+                    Ok(report) => {
+                        let _ = app.emit(
+                            "verification-complete",
+                            compliance_out(&report, &path, transcript, false),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[prompter] verification failed: {e}");
+                        let _ = app.emit("verification-failed", e);
+                    }
+                }
+            });
+        }
+        None => {
+            if let Some(d) = &session.session_dir {
+                let _ = fs::remove_dir_all(d);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The post-session pass: re-transcribe the whole recording (on-device, biased
+/// toward the script), align it against the script, and rewrite the report
+/// with recording-verified coverage, speaking pace, and off-script words.
+fn verify_with_recording(
+    session: &mut TrackingSession,
+    audio: &std::path::Path,
+    duration_secs: u64,
+    section_times: &HashMap<String, u64>,
+    report_path: &std::path::Path,
+) -> Result<prompter_core::ComplianceReport, String> {
+    // Let the live helper finish closing the recording.
+    let deadline = Instant::now() + std::time::Duration::from_secs(8);
+    while AUDIO_RUNNING.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let helper = speech_helper_path();
+    let mut cmd = std::process::Command::new(&helper);
+    cmd.arg("--file").arg(audio);
+    if let Some(dir) = &session.session_dir {
+        cmd.arg("--script").arg(dir.join("script.md"));
+    }
+    let output = cmd.output().map_err(|e| format!("could not run speech helper: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v.get("file_text").is_some())
+        .ok_or_else(|| {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if err.is_empty() { "no transcript from recording".to_string() } else { err }
+        })?;
+    let text = parsed["file_text"].as_str().unwrap_or_default().to_string();
+    let words = parsed["words"].as_u64().unwrap_or(0) as f32;
+    let speaking_secs = parsed["speaking_secs"].as_f64().unwrap_or(0.0) as f32;
+
+    let realigned = realign(session.recorder.sentences(), &text);
+    if !session.recorder.apply_realignment(&realigned) {
+        return Err("recording too short or unclear to verify".into());
+    }
+    let wpm = (speaking_secs >= 30.0).then(|| words / (speaking_secs / 60.0));
+    session.recorder.set_timing(wpm, None);
+    let mut report = session.recorder.build_report(duration_secs);
+    report.section_times = section_times.clone();
+    report
+        .rewrite(report_path)
+        .map_err(|e| format!("could not update report: {e}"))?;
+    let _ = write_private(
+        &report_path.with_extension("recording-transcript.md"),
+        &format!("# Full-recording transcript — {}\n\n{}\n", report.script_title, text),
+    );
+    Ok(report)
 }
 
 /// Start speech recognition using Apple's SFSpeechRecognizer via Swift subprocess.
-/// Streams recognized text to the frontend as "speech" events.
+/// Streams recognized text to the frontend as "speech" events. When a tracking
+/// session is active, the helper also builds a custom language model from the
+/// script and records the microphone for the post-session verification pass;
+/// with "detect the other party" on, it watches call audio too.
 #[tauri::command]
 fn start_speech(app: tauri::AppHandle) -> Result<String, String> {
     if AUDIO_RUNNING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        // Kill previous
+        // Stop the previous helper first.
         AUDIO_STOP.store(true, Ordering::SeqCst);
+        signal_speech_helper();
         std::thread::sleep(std::time::Duration::from_millis(300));
         AUDIO_RUNNING.store(true, Ordering::SeqCst);
     }
     AUDIO_STOP.store(false, Ordering::SeqCst);
+    OTHER_SPEAKING.store(false, Ordering::SeqCst);
     let stop = Arc::clone(&AUDIO_STOP);
 
-    // Find the speech-recognizer binary (bundled next to the app binary)
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_default();
-    let recognizer_path = exe_dir.join("speech-recognizer");
-
+    let recognizer_path = speech_helper_path();
     if !recognizer_path.exists() {
+        AUDIO_RUNNING.store(false, Ordering::SeqCst);
         return Err(format!(
             "Speech recognizer not found at {}",
             recognizer_path.display()
         ));
     }
 
+    let settings = load_settings();
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    {
+        let tstate = app.state::<TrackingState>();
+        let mut guard = tstate.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = guard.as_mut() {
+            if let Some(dir) = &s.session_dir {
+                args.push("--script".into());
+                args.push(dir.join("script.md").into());
+                if settings.verify_with_recording {
+                    args.push("--record".into());
+                    args.push(dir.join("audio.caf").into());
+                }
+            }
+            s.watched_other_party = settings.detect_other_party;
+        }
+    }
+    if settings.detect_other_party {
+        args.push("--system-audio".into());
+    }
+
     std::thread::spawn(move || {
         use std::io::BufRead;
 
         eprintln!(
-            "[prompter] Starting speech recognizer: {}",
-            recognizer_path.display()
+            "[prompter] Starting speech recognizer: {} {:?}",
+            recognizer_path.display(),
+            args
         );
 
         let mut child = match std::process::Command::new(&recognizer_path)
+            .args(&args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -366,6 +630,52 @@ fn start_speech(app: tauri::AppHandle) -> Result<String, String> {
                 return;
             }
         };
+        SPEECH_PID.store(child.id(), Ordering::SeqCst);
+
+        // Surface helper errors instead of failing silently (a denied
+        // microphone / speech permission used to just leave the prompter idle).
+        if let Some(stderr) = child.stderr.take() {
+            let app_err = app.clone();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                    eprintln!("[prompter] helper: {line}");
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        continue;
+                    };
+                    let Some(err) = v.get("error").and_then(|e| e.as_str()) else {
+                        continue;
+                    };
+                    let user_msg = match err {
+                        e if e.starts_with("speech_auth") => Some(
+                            "Speech recognition permission is off. Turn it on for Prompter in System Settings > Privacy & Security > Speech Recognition.".to_string(),
+                        ),
+                        "recognizer_unavailable" => {
+                            Some("On-device speech recognition isn't available on this Mac.".to_string())
+                        }
+                        e if e.starts_with("audio_engine") => Some(format!(
+                            "Couldn't open the microphone ({e}). Check System Settings > Privacy & Security > Microphone."
+                        )),
+                        e if e.starts_with("system_audio") => Some(format!(
+                            "Call-audio detection stopped ({e}). Tracking continues without it."
+                        )),
+                        "screen_capture_denied" => Some(
+                            "Call-audio detection needs Screen & System Audio Recording permission for Prompter. Tracking continues without it.".to_string(),
+                        ),
+                        _ => None,
+                    };
+                    if let Some(msg) = user_msg {
+                        // Call-audio problems are non-fatal: voice tracking
+                        // carries on, so don't trigger the timer fallback.
+                        let event = if err.starts_with("screen_capture") || err.starts_with("system_audio") {
+                            "speech-warning"
+                        } else {
+                            "speech-error"
+                        };
+                        let _ = app_err.emit(event, msg);
+                    }
+                }
+            });
+        }
 
         let stdout = child.stdout.take().unwrap();
         let reader = std::io::BufReader::new(stdout);
@@ -374,81 +684,120 @@ fn start_speech(app: tauri::AppHandle) -> Result<String, String> {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
+            let Ok(line) = line else { continue };
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
 
-            if let Ok(line) = line {
-                eprintln!("[prompter] Speech: {}", &line[..line.len().min(100)]);
-                // Parse JSON and emit to frontend
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(text) = val.get("text").and_then(|t| t.as_str()) {
-                        let is_final = val.get("final").and_then(|f| f.as_bool()).unwrap_or(false);
+            // Status events from the helper (language model, call audio).
+            if let Some(ev) = val.get("event").and_then(|e| e.as_str()) {
+                eprintln!("[prompter] helper event: {line}");
+                let _ = app.emit("speech-status", ev.to_string());
+                continue;
+            }
 
-                        #[derive(Clone, Serialize)]
-                        struct SpeechEvent {
-                            text: String,
-                            is_final: bool,
-                        }
-
-                        let _ = app.emit(
-                            "speech",
-                            SpeechEvent {
-                                text: text.to_string(),
-                                is_final,
-                            },
-                        );
-
-                        // Feed the canonical Rust tracker: accumulate compliance
-                        // evidence, then emit a track-update for the UI. The
-                        // lock guard is dropped at the end of this block, before
-                        // the emit, to avoid holding it across the borrow.
-                        let track = {
-                            let tstate = app.state::<TrackingState>();
-                            // Recover a poisoned lock rather than silently
-                            // dropping tracking (which would stall the scroll).
-                            let mut guard = tstate.0.lock().unwrap_or_else(|p| p.into_inner());
-                            guard.as_mut().map(|s| {
-                                // Log the raw ASR event for offline replay/eval.
-                                if let Some(path) = &s.recording {
-                                    let line = serde_json::json!({
-                                        "type": "asr",
-                                        "t": s.started.elapsed().as_millis() as u64,
-                                        "text": text,
-                                        "final": is_final,
-                                    })
-                                    .to_string();
-                                    use std::io::Write;
-                                    if let Ok(mut f) =
-                                        fs::OpenOptions::new().append(true).open(path)
-                                    {
-                                        let _ = writeln!(f, "{line}");
-                                    }
-                                }
-                                // Align on and record the leading edge (recent
-                                // words). The recognizer streams the whole growing
-                                // cumulative utterance, so recording the raw `text`
-                                // would write the entire script-so-far into every
-                                // transcript line; the leading edge is the words
-                                // actually just spoken for this sentence.
-                                let lead = recent_words(text, 10);
-                                let update = s.tracker.observe(&SpeechUpdate {
-                                    text: lead.clone(),
-                                    words: Vec::new(),
-                                    is_final,
-                                });
-                                s.recorder.record(&update, &lead);
-                                track_event(&update)
-                            })
-                        };
-                        if let Some(ev) = track {
-                            let _ = app.emit("track-update", ev);
-                        }
+            // Other party (call audio) started / finished speaking.
+            if let Some(other) = val.get("other").and_then(|o| o.as_bool()) {
+                OTHER_SPEAKING.store(other, Ordering::SeqCst);
+                if !other {
+                    let secs = val.get("secs").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                    let tstate = app.state::<TrackingState>();
+                    let mut guard = tstate.0.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(s) = guard.as_mut() {
+                        s.patient_talk_secs += secs;
                     }
                 }
+                let _ = app.emit("other-party", other);
+                continue;
+            }
+
+            let Some(text) = val.get("text").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            let is_final = val.get("final").and_then(|f| f.as_bool()).unwrap_or(false);
+            let preview: String = text.chars().take(100).collect();
+            eprintln!("[prompter] Speech: {preview}");
+
+            #[derive(Clone, Serialize)]
+            struct SpeechEvent {
+                text: String,
+                is_final: bool,
+            }
+            let _ = app.emit(
+                "speech",
+                SpeechEvent {
+                    text: text.to_string(),
+                    is_final,
+                },
+            );
+
+            // While the other party is talking, their voice can leak into the
+            // mic through the speakers. Don't let it steer the cursor.
+            if OTHER_SPEAKING.load(Ordering::SeqCst) {
+                continue;
+            }
+
+            // Feed the canonical Rust tracker: accumulate compliance
+            // evidence, then emit a track-update for the UI. The
+            // lock guard is dropped at the end of this block, before
+            // the emit, to avoid holding it across the borrow.
+            let track = {
+                let tstate = app.state::<TrackingState>();
+                // Recover a poisoned lock rather than silently
+                // dropping tracking (which would stall the scroll).
+                let mut guard = tstate.0.lock().unwrap_or_else(|p| p.into_inner());
+                guard.as_mut().map(|s| {
+                    // Log the raw ASR event for offline replay/eval.
+                    if let Some(path) = &s.recording {
+                        let line = serde_json::json!({
+                            "type": "asr",
+                            "t": s.started.elapsed().as_millis() as u64,
+                            "text": text,
+                            "final": is_final,
+                        })
+                        .to_string();
+                        use std::io::Write;
+                        if let Ok(mut f) = fs::OpenOptions::new().append(true).open(path) {
+                            let _ = writeln!(f, "{line}");
+                        }
+                    }
+                    // Align on and record the leading edge (recent
+                    // words). The recognizer streams the whole growing
+                    // cumulative utterance, so recording the raw `text`
+                    // would write the entire script-so-far into every
+                    // transcript line; the leading edge is the words
+                    // actually just spoken for this sentence.
+                    let lead = recent_words(text, 10);
+                    let update = s.tracker.observe(&SpeechUpdate {
+                        text: lead.clone(),
+                        words: Vec::new(),
+                        is_final,
+                    });
+                    s.recorder.record(&update, &lead);
+                    track_event(&update)
+                })
+            };
+            if let Some(ev) = track {
+                let _ = app.emit("track-update", ev);
             }
         }
 
-        // Clean up
-        let _ = child.kill();
-        let _ = child.wait();
+        // Clean up: ask nicely (SIGTERM closes the recording), then insist.
+        signal_speech_helper();
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                _ if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+        SPEECH_PID.store(0, Ordering::SeqCst);
+        OTHER_SPEAKING.store(false, Ordering::SeqCst);
         AUDIO_RUNNING.store(false, Ordering::Relaxed);
         eprintln!("[prompter] Speech recognizer stopped");
     });
@@ -460,6 +809,9 @@ fn start_speech(app: tauri::AppHandle) -> Result<String, String> {
 #[tauri::command]
 fn stop_speech() -> Result<(), String> {
     AUDIO_STOP.store(true, Ordering::SeqCst);
+    // Signal the helper directly: the reader loop only checks the stop flag
+    // when a line arrives, which may be never if the room has gone quiet.
+    signal_speech_helper();
     Ok(())
 }
 
@@ -493,6 +845,7 @@ fn save_compliance(report: SessionReport) -> Result<String, String> {
         branches_taken: report.branches_taken,
         total_words: report.total_words,
         words_delivered: report.words_delivered,
+        delivery: Default::default(),
     };
 
     let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -512,7 +865,7 @@ fn settings_path() -> std::path::PathBuf {
     home.join(".prompter").join("settings.json")
 }
 
-#[derive(Debug, Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Serialize, serde::Deserialize)]
 struct Settings {
     #[serde(default = "default_font_size")]
     font_size: u32,
@@ -528,6 +881,30 @@ struct Settings {
     hide_from_screen_share: Option<bool>,
     #[serde(default)]
     recent_scripts: Vec<RecentScript>,
+    /// Record the session and re-check coverage against the full recording
+    /// afterward (the recording is deleted once checked).
+    #[serde(default = "default_true")]
+    verify_with_recording: bool,
+    /// Keep the session audio after the verification pass (off by default:
+    /// consult audio is patient data).
+    #[serde(default)]
+    keep_session_audio: bool,
+    /// Watch call audio to know when the other party is speaking (needs Screen
+    /// & System Audio Recording permission).
+    #[serde(default)]
+    detect_other_party: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Settings {
+    /// The same defaults a settings file with missing keys gets, so a fresh
+    /// install (no file yet) behaves identically.
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("all Settings fields have serde defaults")
+    }
 }
 
 fn default_highlight_mode() -> String {
@@ -670,6 +1047,7 @@ fn get_coaching(report: SessionReport) -> Vec<CoachingInsight> {
         branches_taken: report.branches_taken,
         total_words: report.total_words,
         words_delivered: report.words_delivered,
+        delivery: Default::default(),
     };
 
     prompter_core::coaching::analyze(&compliance)
@@ -687,7 +1065,7 @@ fn get_coaching(report: SessionReport) -> Vec<CoachingInsight> {
         .collect()
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct CoachingInsight {
     severity: String,
     message: String,
@@ -905,6 +1283,7 @@ fn main() {
             init_tracking,
             clear_tracking,
             finish_tracking,
+            set_tracking_position,
             start_speech,
             stop_speech,
             save_compliance,

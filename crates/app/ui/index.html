@@ -90,6 +90,10 @@
       <tr><td>H</td><td>This help</td></tr>
       <tr><td>Esc</td><td>End session</td></tr>
     </table>
+    <h3 style="margin-top:22px">Session options</h3>
+    <label class="opt"><input type="checkbox" id="optVerify"> Double-check coverage against the full recording after each session <span class="opt-note">Audio is deleted once checked</span></label>
+    <label class="opt"><input type="checkbox" id="optKeepAudio"> Keep session audio <span class="opt-note">Off by default: consult audio is patient data</span></label>
+    <label class="opt"><input type="checkbox" id="optOther"> Detect when the patient is talking on a call <span class="opt-note">Uses call audio; needs Screen &amp; System Audio Recording permission</span></label>
   </div>
 </div>
 
@@ -113,6 +117,10 @@ let vadAdvanceTimer = null;  // accumulates speaking time to advance sentences
 let script = null;
 let items = [];          // flat array of {text, words, section, kind:'s'|'p'}
 let mainSentenceItemIdx = []; // tracker sentence_index -> items index
+let otherSpeaking = false;     // call audio: the patient is talking
+let liveCue = null;            // 'pause' when the tracker reached a PAUSE point
+let turnEnded = false;         // the patient just finished answering at a pause
+let otherUnlisten = null;
 let trackUnlisten = null;     // 'track-update' (Rust tracker) subscription
 let idx = 0;
 let state = 'idle';      // idle | loaded | run | pause | wait | done
@@ -383,12 +391,28 @@ async function startAppleSpeech(){
       if(state!=='run') return;
       const itemIdx = mainSentenceItemIdx[u.sentence_index];
       if(itemIdx === undefined) return;
-      if(itemIdx > idx){
+      // Forward-only, except when the tracker's whole-script relocator has
+      // confirmed a real skip or a jump back to re-read.
+      if(itemIdx > idx || (u.relocated && itemIdx !== idx)){
         idx = itemIdx;
         trackSection();
         highlight();
       }
+      const cue = u.state === 'pause' ? 'pause' : null;
+      if(cue !== liveCue){ liveCue = cue; turnEnded = false; updateSt(); }
     });
+
+    // Call audio: show when the patient is talking, and when they've finished
+    // answering at a pause point (a silence-based end-of-turn).
+    otherUnlisten = await listen('other-party', (event)=>{
+      otherSpeaking = !!event.payload;
+      if(!otherSpeaking && liveCue === 'pause') turnEnded = true;
+      updateSt();
+    });
+
+    // Non-fatal helper problems (e.g. call-audio permission): tell the user,
+    // keep tracking.
+    listen('speech-warning', (event)=>{ showErr(event.payload); }).then(()=>{});
 
     // Listen for errors
     listen('speech-error', (event)=>{
@@ -406,6 +430,8 @@ async function startAppleSpeech(){
 function stopAppleSpeech(){
   if(speechUnlisten){speechUnlisten();speechUnlisten=null}
   if(trackUnlisten){trackUnlisten();trackUnlisten=null}
+  if(otherUnlisten){otherUnlisten();otherUnlisten=null}
+  otherSpeaking = false; liveCue = null; turnEnded = false;
   invoke('stop_speech').catch(()=>{});
   audioMode = false;
 }
@@ -507,21 +533,28 @@ function endSession(){
   // Brief delay first so any in-flight recognized line is fed to the tracker
   // before we build the report (stop_speech flips a flag; it does not join).
   setTimeout(()=>{
-  invoke('finish_tracking', { durationSecs: elapsed, sectionTimes: sectionTimesMap }).then(rep => {
+  invoke('finish_tracking', { durationSecs: elapsed, sectionTimes: sectionTimesMap }).then(async rep => {
     showSavedPath(rep.saved_path);
-    invoke('get_coaching', { report: {
-      script_title: rep.script_title,
-      script_version: rep.script_version || null,
-      sections_covered: rep.sections_covered,
-      sections_skipped: rep.sections_skipped,
-      duration_secs: rep.duration_secs,
-      section_times: sectionTimesMap,
-      pause_points_reached: rep.pause_points_reached,
-      pause_points_total: rep.pause_points_total,
-      branches_taken: rep.branches_taken,
-      total_words: rep.total_words,
-      words_delivered: rep.words_delivered
-    }}).then(renderCoaching).catch(e=>{console.warn('coaching:',e)});
+    renderCoaching(rep.coaching);
+    const note = document.createElement('div');
+    note.style.cssText = 'font-size:12px;color:var(--text-muted);margin-top:6px';
+    note.textContent = Math.round(rep.adherence_pct)+'% of the script delivered (live tracking).';
+    card.appendChild(note);
+    if(!rep.verifying) return;
+    note.textContent += ' Checking against the full recording\u2026';
+    const offs = [];
+    const done = () => { offs.forEach(f=>f()); };
+    offs.push(await listen('verification-complete', (event)=>{
+      const v = event.payload;
+      note.textContent = 'Checked against the full recording: '+Math.round(v.adherence_pct)+'% of the script delivered. Report updated.';
+      const old = card.querySelector('.coach'); if(old) old.remove();
+      renderCoaching(v.coaching);
+      done();
+    }));
+    offs.push(await listen('verification-failed', (event)=>{
+      note.textContent += ' Couldn\u2019t check the recording ('+event.payload+'); the live report stands.';
+      done();
+    }));
   }).catch(()=>{
     invoke('save_compliance', { report: jsReport }).then(showSavedPath).catch(e=>{showErr('Compliance report not saved: '+e)});
     invoke('get_coaching', { report: jsReport }).then(renderCoaching).catch(e=>{console.warn('coaching:',e)});
@@ -532,6 +565,7 @@ function endSession(){
   function renderCoaching(insights){
     if(!insights || !insights.length) return;
     const coachDiv = document.createElement('div');
+    coachDiv.className = 'coach';
     coachDiv.style.cssText = 'text-align:left;margin-bottom:20px;padding:12px;background:var(--bg);border-radius:var(--radius-sm);border:1px solid var(--border-subtle)';
 
     const coachTitle = document.createElement('div');
@@ -571,15 +605,24 @@ function endSession(){
 }
 
 // ── Navigation ──
+// Manual navigation re-anchors the voice tracker, so speech is matched from
+// where the speaker says they are (the "I'm here" override).
+function syncTracker(){
+  if(!audioMode) return;
+  let s = -1;
+  for(let k=0;k<mainSentenceItemIdx.length;k++){ if(mainSentenceItemIdx[k] <= idx) s = k; else break; }
+  if(s >= 0) invoke('set_tracking_position', {sentenceIndex: s}).catch(()=>{});
+}
 function advance(){
-  if(idx<items.length-1){idx++;trackSection();highlight()}
+  if(idx<items.length-1){idx++;trackSection();highlight();syncTracker()}
   else if(state==='run') endSession();
 }
-function retreat(){if(idx>0){idx--;highlight()}}
+function retreat(){if(idx>0){idx--;highlight();syncTracker()}}
 function jumpSec(si){
   const i=items.findIndex(it=>it.section===si);
   if(i>=0){
     idx=i;
+    syncTracker();
     if(!secTimes[si]) secTimes[si]=Date.now();
     highlight();
     const el=$('sec-'+si);
@@ -738,7 +781,10 @@ function updateSt(){
   const d=els.dot, l=els.stLabel;
   d.className='dot';
   switch(state){
-    case 'run': d.classList.add('go'); l.textContent=audioMode?(vadSpeaking?'Tracking your voice':'Listening\u2026'):'Auto-scrolling\u2026'; break;
+    case 'run':
+      if(audioMode && otherSpeaking){ d.classList.add('wait'); l.textContent='Patient speaking\u2026'; break; }
+      if(audioMode && liveCue==='pause'){ d.classList.add('wait'); l.textContent=turnEnded?'Patient finished \u2014 continue':'Pause \u2014 let the patient respond'; break; }
+      d.classList.add('go'); l.textContent=audioMode?(vadSpeaking?'Tracking your voice':'Listening\u2026'):'Auto-scrolling\u2026'; break;
     case 'pause': d.classList.add('stop'); l.textContent='Paused'; break;
     case 'wait': d.classList.add('wait'); l.textContent='Waiting for response\u2026'; break;
     case 'done': d.classList.add('fin'); l.textContent='Complete'; break;
@@ -870,6 +916,27 @@ async function loadRecents(){
     container.appendChild(item);
   });
 }
+
+// ── Session options (help panel) ──
+async function bindSessionOptions(){
+  let st = {};
+  try{ st = await invoke('load_settings'); }catch(e){}
+  const map = {optVerify:'verify_with_recording', optKeepAudio:'keep_session_audio', optOther:'detect_other_party'};
+  const defaults = {verify_with_recording:true, keep_session_audio:false, detect_other_party:false};
+  Object.entries(map).forEach(([id,key])=>{
+    const el = document.getElementById(id);
+    if(!el) return;
+    el.checked = st[key] ?? defaults[key];
+    el.addEventListener('change', async ()=>{
+      try{
+        const cur = await invoke('load_settings');
+        cur[key] = el.checked;
+        await invoke('save_settings', {settings: cur});
+      }catch(e){ showErr('Couldn\u2019t save option: '+e); }
+    });
+  });
+}
+bindSessionOptions();
 
 // ── Keyboard ──
 document.addEventListener('keydown', e=>{

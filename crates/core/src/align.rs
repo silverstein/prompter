@@ -62,6 +62,21 @@ const COVERAGE_THRESHOLD: f32 = 0.5;
 /// never blocked; the acceptance threshold still uses the raw density.
 const WORD_LOCALITY: f32 = 0.06;
 
+/// Longest run of recognized words joined to match one long script word (and
+/// vice versa). Three covers the common drug-name splits.
+const MAX_SPLIT: usize = 3;
+/// Only words at least this long are candidates for split/joined matching.
+const SPLIT_MIN_LEN: usize = 6;
+/// Phonetic matching only applies when both words are at least this long, so
+/// short common words never match on sound alone.
+const PHONETIC_MIN_LEN: usize = 5;
+/// Minimum similarity of two phonetic keys (normalized edit distance) for a
+/// sound-alike match.
+const PHONETIC_MATCH: f32 = 0.8;
+/// Score a sound-alike match earns (just above [`WORD_MATCH`]) -- weaker than
+/// an exact or spelled-alike match so it never outranks one.
+const PHONETIC_SCORE: f32 = 0.75;
+
 /// Internal result of a windowed search: the reference word the alignment
 /// ends on, its sentence, a confidence, and whether it clears the bar.
 struct SearchHit {
@@ -69,6 +84,23 @@ struct SearchHit {
     sentence: usize,
     confidence: f32,
     matched: bool,
+    matched_words: usize,
+}
+
+/// A whole-script match found by [`AlignmentEngine::locate_global`], used by
+/// the tracker's relocator to recover from a real skip (or a jump back) that
+/// lies outside the local search band.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GlobalHit {
+    /// Sentence the alignment ends on.
+    pub sentence: usize,
+    /// Reference word the alignment ends on (strictly increases as the reader
+    /// keeps reading in the same region).
+    pub end_word: usize,
+    /// Matched words on the aligned path.
+    pub matched_words: usize,
+    /// Match density along the aligned path (0.0-1.0).
+    pub confidence: f32,
 }
 
 /// Tracks the speaker's position in the script via word-level text alignment.
@@ -141,19 +173,28 @@ impl AlignmentEngine {
         if self.words.is_empty() {
             return None;
         }
-        let norm = normalize(recognized);
-        let q: Vec<&str> = norm.split_whitespace().collect();
-        if q.len() < 2 {
-            // Need at least a two-word run to align reliably.
-            return None;
-        }
-
         // Reference band: window_radius sentences each side of the cursor, in
         // words. Bounding the band is what makes a distant coincidence not even
         // a candidate.
         let cur_sent = self.position();
         let lo = cur_sent.saturating_sub(self.window_radius);
         let hi = (cur_sent + self.window_radius).min(self.sentence_count.saturating_sub(1));
+        self.search_band(recognized, lo, hi, WORD_LOCALITY)
+    }
+
+    /// Align `recognized` against every sentence in `lo..=hi` (inclusive). The
+    /// `locality` cost per word of distance from the cursor biases endpoint
+    /// selection toward the cursor; the whole-script relocator passes 0.0.
+    fn search_band(&self, recognized: &str, lo: usize, hi: usize, locality: f32) -> Option<SearchHit> {
+        if self.words.is_empty() || lo > hi || hi >= self.sentence_count {
+            return None;
+        }
+        let norm = normalize(recognized);
+        let q: Vec<&str> = norm.split_whitespace().collect();
+        if q.len() < 2 {
+            // Need at least a two-word run to align reliably.
+            return None;
+        }
         let r_start = self.sentence_first_word[lo];
         let r_end = if hi + 1 < self.sentence_count {
             self.sentence_first_word[hi + 1]
@@ -208,6 +249,38 @@ impl AlignmentEngine {
                     count = mc[i][j - 1];
                     plen = pl[i][j - 1] + 1;
                 }
+                // Split words: the recognizer often hears one long word (a drug
+                // name) as 2-3 short ones ("metro pro law" for "metoprolol"), or
+                // two script words as one ("healthcare" for "health care"). Try
+                // matching the joined run as a single step; it only fires for
+                // long words, where a coincidence is unlikely.
+                for k in 2..=MAX_SPLIT {
+                    if i >= k && r[j - 1].len() >= SPLIT_MIN_LEN {
+                        let joined: String = q[i - k..i].concat();
+                        let ms = word_sim(&joined, &r[j - 1]);
+                        if ms >= WORD_MATCH {
+                            let cand = h[i - k][j - 1] + ms;
+                            if cand > score {
+                                score = cand;
+                                count = mc[i - k][j - 1] + 1;
+                                plen = pl[i - k][j - 1] + 1;
+                            }
+                        }
+                    }
+                    if j >= k && q[i - 1].len() >= SPLIT_MIN_LEN {
+                        let joined: String =
+                            r[j - k..j].iter().map(String::as_str).collect::<String>();
+                        let ms = word_sim(q[i - 1], &joined);
+                        if ms >= WORD_MATCH {
+                            let cand = h[i - 1][j - k] + ms;
+                            if cand > score {
+                                score = cand;
+                                count = mc[i - 1][j - k] + 1;
+                                plen = pl[i - 1][j - k] + 1;
+                            }
+                        }
+                    }
+                }
                 h[i][j] = score;
                 mc[i][j] = count;
                 pl[i][j] = plen;
@@ -219,7 +292,7 @@ impl AlignmentEngine {
                 // actually at, unless the distant match is clearly stronger.
                 if count > 0 {
                     let dist = (j as isize - cursor_local).unsigned_abs() as f32;
-                    let adj = score - WORD_LOCALITY * dist;
+                    let adj = score - locality * dist;
                     if adj > best_adj + 1e-4 {
                         best_adj = adj;
                         best = score;
@@ -241,6 +314,7 @@ impl AlignmentEngine {
                 sentence: self.position(),
                 confidence: 0.0,
                 matched: false,
+                matched_words: 0,
             });
         }
         let end_word = r_start + best_j - 1;
@@ -254,7 +328,31 @@ impl AlignmentEngine {
             sentence,
             confidence,
             matched,
+            matched_words: best_mc,
         })
+    }
+
+    /// Search the WHOLE script (no window, no locality bias) for the best run
+    /// matching `recognized`. Pure / non-mutating. Returns `None` when nothing
+    /// aligns. Callers must apply their own (strict) acceptance bar: this exists
+    /// so the tracker can recover from a real skip or jump back that lies
+    /// outside the local band, not to steer the cursor on its own.
+    pub fn locate_global(&self, recognized: &str) -> Option<GlobalHit> {
+        let hit = self.search_band(recognized, 0, self.sentence_count.checked_sub(1)?, 0.0)?;
+        if hit.matched_words == 0 {
+            return None;
+        }
+        Some(GlobalHit {
+            sentence: hit.sentence,
+            end_word: hit.end_word,
+            matched_words: hit.matched_words,
+            confidence: hit.confidence,
+        })
+    }
+
+    /// Reference-word index of the cursor (finer-grained than [`Self::position`]).
+    pub fn cursor_word(&self) -> usize {
+        self.cursor_word
     }
 
     /// Attempt to align recognized text and COMMIT: on a confident match the
@@ -327,7 +425,7 @@ impl AlignmentEngine {
 /// words (<=3 chars) match ONLY exactly, to avoid "the"~"she" style bigram
 /// coincidences; longer words fuzzy-match via character-bigram Dice so ASR
 /// errors and plurals still align.
-fn word_sim(a: &str, b: &str) -> f32 {
+pub(crate) fn word_sim(a: &str, b: &str) -> f32 {
     if a == b {
         return 1.0;
     }
@@ -335,11 +433,104 @@ fn word_sim(a: &str, b: &str) -> f32 {
         return 0.0;
     }
     let ab = bigrams(a);
-    bigram_similarity(&ab, b)
+    let spelled = bigram_similarity(&ab, b);
+    if spelled >= WORD_MATCH || a.len() < PHONETIC_MIN_LEN || b.len() < PHONETIC_MIN_LEN {
+        return spelled;
+    }
+    // Sound-alike fallback: the recognizer often spells a drug name the way it
+    // sounds ("metro pro law" joined -> "metroprolaw" for "metoprolol"). Compare
+    // consonant skeletons; the FDA's POCA drug-name tool uses the same idea.
+    let (ka, kb) = (phonetic_key(a), phonetic_key(b));
+    if ka.len() < 4 || kb.len() < 4 {
+        return spelled;
+    }
+    if key_similarity(&ka, &kb) >= PHONETIC_MATCH {
+        PHONETIC_SCORE.max(spelled)
+    } else {
+        spelled
+    }
+}
+
+/// A compact sound key: a consonant skeleton with common English spelling
+/// variants folded together (ph->f, ck/q/c(hard)->k, soft c/z->s, x->ks,
+/// silent gh dropped), vowels and w/h/y dropped after the first letter, and
+/// doubled letters collapsed. Deliberately simple (Metaphone-flavoured); it only
+/// needs to make ASR spellings of the same spoken word land close together.
+pub(crate) fn phonetic_key(word: &str) -> String {
+    let w: Vec<char> = word
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let mut out: Vec<char> = Vec::with_capacity(w.len());
+    let mut i = 0;
+    while i < w.len() {
+        let c = w[i];
+        let next = w.get(i + 1).copied();
+        let mapped: Option<char> = match c {
+            'p' if next == Some('h') => {
+                i += 1;
+                Some('f')
+            }
+            'g' if next == Some('h') => {
+                i += 1;
+                None
+            }
+            'c' if next == Some('k') => {
+                i += 1;
+                Some('k')
+            }
+            'c' if matches!(next, Some('e' | 'i' | 'y')) => Some('s'),
+            'c' | 'q' => Some('k'),
+            'z' => Some('s'),
+            'x' => {
+                if out.last() != Some(&'k') {
+                    out.push('k');
+                }
+                Some('s')
+            }
+            'a' | 'e' | 'i' | 'o' | 'u' | 'w' | 'h' | 'y' => {
+                if out.is_empty() {
+                    Some(c)
+                } else {
+                    None
+                }
+            }
+            _ => Some(c),
+        };
+        if let Some(m) = mapped {
+            if out.last() != Some(&m) {
+                out.push(m);
+            }
+        }
+        i += 1;
+    }
+    out.into_iter().collect()
+}
+
+/// Normalized edit-distance similarity (1.0 = identical) of two short keys.
+fn key_similarity(a: &str, b: &str) -> f32 {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let longest = a.len().max(b.len());
+    if longest == 0 {
+        return 1.0;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let sub = prev[j - 1] + usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = sub.min(prev[j] + 1).min(cur[j - 1] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    1.0 - prev[b.len()] as f32 / longest as f32
 }
 
 /// Normalize text for comparison: lowercase, strip punctuation, collapse whitespace.
-fn normalize(text: &str) -> String {
+pub(crate) fn normalize(text: &str) -> String {
     text.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == ' ' {
@@ -627,5 +818,57 @@ mod tests {
             yes > no,
             "matching option must beat the other: {yes} vs {no}"
         );
+    }
+
+    #[test]
+    fn phonetic_keys_fold_spelling_variants() {
+        assert_eq!(phonetic_key("metoprolol"), phonetic_key("metoprolol"));
+        assert_eq!(phonetic_key("phosphate"), phonetic_key("fosfate"));
+        assert!(key_similarity(&phonetic_key("metoprolol"), &phonetic_key("metroprolaw")) >= PHONETIC_MATCH);
+        // Short / unrelated words stay apart.
+        assert!(word_sim("the", "she") < WORD_MATCH);
+        assert!(word_sim("warfarin", "morning") < WORD_MATCH);
+    }
+
+    #[test]
+    fn split_drug_name_still_aligns() {
+        // The recognizer hears "metoprolol" as three short words. Joined, they
+        // sound like the script word, so the run still aligns on sentence 1.
+        let sentences = vec![
+            "lets start with your heart medication".into(),
+            "you take metoprolol every morning with breakfast".into(),
+            "it keeps your heart rate steady".into(),
+        ];
+        let eng = AlignmentEngine::new(sentences);
+        let r = eng.peek("you take metro pro law every morning");
+        assert!(r.matched, "split drug name should align");
+        assert_eq!(r.position, 1);
+    }
+
+    #[test]
+    fn joined_words_align_to_two_script_words() {
+        let sentences = vec![
+            "talk to your health care provider first".into(),
+            "then we will review the plan".into(),
+        ];
+        let eng = AlignmentEngine::new(sentences);
+        let r = eng.peek("talk to your healthcare provider");
+        assert!(r.matched);
+        assert_eq!(r.position, 0);
+    }
+
+    #[test]
+    fn locate_global_finds_a_far_passage_outside_the_band() {
+        let mut sentences: Vec<String> = (0..40)
+            .map(|i| format!("filler sentence number {i} about nothing in particular"))
+            .collect();
+        sentences[33] = "your pharmacist will call the prescriber about the interaction".into();
+        let mut eng = AlignmentEngine::new(sentences);
+        eng.set_window_radius(5);
+        let text = "your pharmacist will call the prescriber about";
+        assert!(!eng.peek(text).matched, "outside the local band");
+        let g = eng.locate_global(text).expect("global hit");
+        assert_eq!(g.sentence, 33);
+        assert!(g.matched_words >= 6);
     }
 }

@@ -12,8 +12,31 @@ use std::path::{Path, PathBuf};
 // pause points reached, branches taken, total duration.
 // ──────────────────────────────────────────────────────────────
 
+/// How the script was delivered, beyond coverage. Categories follow reading
+/// assessment practice (Microsoft Reading Progress: omission, insertion,
+/// repetition) so coaching speaks a familiar language.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DeliveryStats {
+    /// Script lines not delivered (short excerpts, in script order).
+    pub omitted_lines: Vec<String>,
+    /// Times the speaker went back to re-read / restart a line.
+    pub repeats: usize,
+    /// Separate stretches of off-script speech the live tracker noticed.
+    pub off_script_episodes: usize,
+    /// Words spoken that matched no script word (from the full-recording pass).
+    pub off_script_words: Option<usize>,
+    /// Speaking pace in words per minute over time actually spent speaking.
+    pub speaking_wpm: Option<f32>,
+    /// Seconds the other party (patient) was heard speaking, when call audio
+    /// was captured separately.
+    pub patient_talk_secs: Option<u64>,
+    /// True when coverage comes from re-aligning the full recording rather than
+    /// the live tracker alone.
+    pub verified_by_recording: bool,
+}
+
 /// A completed session's compliance data.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ComplianceReport {
     pub script_title: String,
     pub script_version: Option<String>,
@@ -26,6 +49,7 @@ pub struct ComplianceReport {
     pub branches_taken: HashMap<String, String>,
     pub total_words: usize,
     pub words_delivered: usize,
+    pub delivery: DeliveryStats,
 }
 
 impl ComplianceReport {
@@ -57,7 +81,18 @@ impl ComplianceReport {
             path = dir.join(format!("{}-{}.md", base, counter));
             counter += 1;
         }
+        write_private(&path, &self.render(&date))?;
+        Ok(path)
+    }
 
+    /// Rewrite an existing report file in place (e.g. after the full-recording
+    /// verification pass upgrades the live report). Keeps 0600 permissions.
+    pub fn rewrite(&self, path: &Path) -> Result<(), std::io::Error> {
+        write_private(path, &self.render(&chrono_lite_date()))
+    }
+
+    /// Render the report as Minutes-compatible markdown.
+    pub fn render(&self, date: &str) -> String {
         let mut content = String::new();
 
         // YAML frontmatter
@@ -135,18 +170,49 @@ impl ComplianceReport {
             content.push_str(&format!("- [ ] {} (skipped)\n", name));
         }
 
-        // Write with restrictive permissions (0600)
-        std::fs::write(&path, &content)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&path, perms)?;
+        // Delivery detail
+        let d = &self.delivery;
+        content.push_str("\n## Delivery\n\n");
+        content.push_str(&format!(
+            "Coverage source: {}.\n\n",
+            if d.verified_by_recording {
+                "full recording re-aligned against the script after the session"
+            } else {
+                "live tracking only"
+            }
+        ));
+        if let Some(wpm) = d.speaking_wpm {
+            content.push_str(&format!("- Speaking pace: {:.0} words per minute\n", wpm));
+        }
+        if let Some(secs) = d.patient_talk_secs {
+            content.push_str(&format!("- Patient speaking time: {}\n", fmt_duration(secs)));
+        }
+        content.push_str(&format!("- Lines restarted: {}\n", d.repeats));
+        content.push_str(&format!("- Off-script stretches: {}\n", d.off_script_episodes));
+        if let Some(w) = d.off_script_words {
+            content.push_str(&format!("- Off-script words (incl. patient): {}\n", w));
+        }
+        if !d.omitted_lines.is_empty() {
+            content.push_str("\n### Lines not delivered\n\n");
+            for line in &d.omitted_lines {
+                content.push_str(&format!("- {}\n", line));
+            }
         }
 
-        Ok(path)
+        content
     }
+}
+
+/// Write `content` to `path` readable only by the owner (reports and
+/// transcripts contain patient conversation).
+pub fn write_private(path: &Path, content: &str) -> Result<(), std::io::Error> {
+    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn fmt_duration(secs: u64) -> String {
@@ -234,6 +300,7 @@ mod tests {
             branches_taken: HashMap::new(),
             total_words: 1000,
             words_delivered: 850,
+            ..Default::default()
         };
 
         assert_eq!(report.adherence_pct(), 85.0);
@@ -263,6 +330,7 @@ mod tests {
             branches_taken: HashMap::from([("Question?".into(), "YES".into())]),
             total_words: 500,
             words_delivered: 400,
+            ..Default::default()
         };
 
         let path = report.write_to_dir(&dir).expect("write failed");
