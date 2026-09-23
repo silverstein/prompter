@@ -79,7 +79,17 @@ const PHONETIC_SCORE: f32 = 0.75;
 
 /// Internal result of a windowed search: the reference word the alignment
 /// ends on, its sentence, a confidence, and whether it clears the bar.
+/// How far (in sentences) a second match must be from the best one to count as
+/// a separate copy of repeated text in [`AlignmentEngine::locate_global`].
+const REPEAT_GAP: usize = 3;
+/// A second match scoring at least this fraction of the best one is treated as
+/// the same text repeated (a sound-alike near miss scores well below).
+const REPEAT_SCORE_RATIO: f32 = 0.9;
+
 struct SearchHit {
+    /// Raw alignment score at the endpoint (sum of word similarities less
+    /// penalties): stronger for exact words than for sound-alikes.
+    score: f32,
     end_word: usize,
     sentence: usize,
     confidence: f32,
@@ -101,6 +111,10 @@ pub struct GlobalHit {
     pub matched_words: usize,
     /// Match density along the aligned path (0.0-1.0).
     pub confidence: f32,
+    /// Another, distant passage matches about as well: the script repeats this
+    /// text, so the words alone can't say which copy is being read. Callers
+    /// should wait for words past the repeated part before moving.
+    pub ambiguous: bool,
 }
 
 /// Tracks the speaker's position in the script via word-level text alignment.
@@ -310,6 +324,7 @@ impl AlignmentEngine {
             // "couldn't evaluate" (too short / empty band) returned as None
             // above, which is not a miss.
             return Some(SearchHit {
+                score: 0.0,
                 end_word: self.cursor_word,
                 sentence: self.position(),
                 confidence: 0.0,
@@ -324,6 +339,7 @@ impl AlignmentEngine {
         let confidence = (best_mc as f32 / best_pl as f32).clamp(0.0, 1.0);
         let matched = best_mc >= MIN_MATCH_WORDS && confidence >= COVERAGE_THRESHOLD;
         Some(SearchHit {
+            score: best,
             end_word,
             sentence,
             confidence,
@@ -338,7 +354,35 @@ impl AlignmentEngine {
     /// so the tracker can recover from a real skip or jump back that lies
     /// outside the local band, not to steer the cursor on its own.
     pub fn locate_global(&self, recognized: &str) -> Option<GlobalHit> {
-        let hit = self.search_band(recognized, 0, self.sentence_count.checked_sub(1)?, 0.0)?;
+        let last = self.sentence_count.checked_sub(1)?;
+        let hit = self.search_band(recognized, 0, last, 0.0)?;
+        if hit.matched_words == 0 {
+            return None;
+        }
+        // Repeated text: search again outside this passage (a couple of
+        // sentences either side, so the same run isn't found twice) and flag a
+        // rival that matches about as well.
+        let s = hit.sentence;
+        let before = if s >= REPEAT_GAP { self.search_band(recognized, 0, s - REPEAT_GAP, 0.0) } else { None };
+        let after = if s + REPEAT_GAP <= last { self.search_band(recognized, s + REPEAT_GAP, last, 0.0) } else { None };
+        let ambiguous = before
+            .into_iter()
+            .chain(after)
+            .any(|r| r.matched_words > 0 && r.score >= REPEAT_SCORE_RATIO * hit.score);
+        Some(GlobalHit {
+            sentence: hit.sentence,
+            end_word: hit.end_word,
+            matched_words: hit.matched_words,
+            confidence: hit.confidence,
+            ambiguous,
+        })
+    }
+
+    /// Like [`Self::locate_global`] but only within the local window around the
+    /// cursor (with the usual locality bias), reporting matched-word counts so a
+    /// caller can compare its strength against another engine's hit.
+    pub fn locate_local(&self, recognized: &str) -> Option<GlobalHit> {
+        let hit = self.search(recognized)?;
         if hit.matched_words == 0 {
             return None;
         }
@@ -347,6 +391,7 @@ impl AlignmentEngine {
             end_word: hit.end_word,
             matched_words: hit.matched_words,
             confidence: hit.confidence,
+            ambiguous: false,
         })
     }
 

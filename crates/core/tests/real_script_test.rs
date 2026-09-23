@@ -189,3 +189,217 @@ fn simulated_skip_is_followed() {
         "expected to follow the skip to ~{skip_to}, cursor at {at}"
     );
 }
+
+/// Replay of a real live read (Sept 23, Apple partials only, no finals) of a
+/// short test script. At ~71 s the reader goes back two sentences, from "He
+/// relit the lamp..." (8) to "On the fourth night..." (6), and re-reads. The
+/// cursor must follow back, then carry on to the end.
+#[test]
+fn real_read_going_back_is_followed() {
+    use prompter_core::{recent_words, ScriptTracker, SpeechUpdate};
+    let rec = include_str!("fixtures/lighthouse-reread.recording.jsonl");
+    let mut tracker: Option<ScriptTracker> = None;
+    let mut went_back_to = None;
+    let mut last = 0usize;
+    for line in rec.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        match v["type"].as_str() {
+            Some("script") => {
+                let parsed = script::parse(v["source"].as_str().unwrap()).unwrap();
+                let mut t = ScriptTracker::new(&parsed);
+                t.set_window_radius(10);
+                tracker = Some(t);
+            }
+            Some("asr") => {
+                let t = tracker.as_mut().unwrap();
+                let ms = v["t"].as_u64().unwrap();
+                let u = t.observe(&SpeechUpdate {
+                    text: recent_words(v["text"].as_str().unwrap(), 10),
+                    words: Vec::new(),
+                    is_final: v["final"].as_bool().unwrap_or(false),
+                });
+                if (71_500..82_000).contains(&ms) && u.relocated {
+                    went_back_to = Some(u.sentence_index);
+                }
+                if !u.relocated {
+                    assert!(u.sentence_index >= last, "went back {} -> {} at {ms}ms without relocating", last, u.sentence_index);
+                }
+                last = u.sentence_index;
+            }
+            _ => {}
+        }
+    }
+    let back = went_back_to.expect("the re-read at ~72s should move the cursor back");
+    assert!((6..=7).contains(&back), "went back to {back}");
+    assert_eq!(last, 15, "should finish on the last sentence");
+}
+
+/// Main sentences and the NO/YES option sentences of the real MTM script, plus
+/// a tracker positioned for a word-by-word partials read.
+fn mtm_branch_setup() -> (prompter_core::ScriptTracker, Vec<String>, Vec<String>, Vec<String>) {
+    use prompter_core::{ScriptTracker, TimelineStep};
+    let script = script::parse(MTM_SCRIPT).unwrap();
+    let mut tracker = ScriptTracker::new(&script);
+    tracker.set_window_radius(10);
+    let (mut main, mut yes, mut no) = (Vec::new(), Vec::new(), Vec::new());
+    for step in tracker.timeline() {
+        match step {
+            TimelineStep::Sentence { text, .. } => main.push(text.clone()),
+            TimelineStep::BranchSentence { option_label, text } if option_label == "YES" => yes.push(text.clone()),
+            TimelineStep::BranchSentence { text, .. } => no.push(text.clone()),
+            _ => {}
+        }
+    }
+    (tracker, main, yes, no)
+}
+
+/// Read `sentences` word by word as Apple-style partials, collecting updates.
+fn read_partials(
+    tracker: &mut prompter_core::ScriptTracker,
+    spoken: &mut String,
+    sentences: &[String],
+) -> Vec<prompter_core::TrackUpdate> {
+    use prompter_core::{recent_words, SpeechUpdate};
+    let mut out = Vec::new();
+    for s in sentences {
+        for word in s.split_whitespace() {
+            spoken.push(' ');
+            spoken.push_str(word);
+            out.push(tracker.observe(&SpeechUpdate::partial(recent_words(spoken, 10))));
+        }
+    }
+    out
+}
+
+/// Reading the NO answer, which opens with a sentence the YES answer also
+/// contains: nothing is selected on the shared sentence, NO is selected once
+/// its own words are heard, and reading the Closing returns to the main line.
+#[test]
+fn branch_option_is_picked_from_reading_even_with_shared_text() {
+    use prompter_core::TrackState;
+    let (mut t, main, _yes, no) = mtm_branch_setup();
+    let trigger = main.iter().position(|s| s.contains("Prevnar")).unwrap();
+    let mut spoken = String::new();
+    read_partials(&mut t, &mut spoken, &main[trigger - 2..=trigger]);
+    let shared = read_partials(&mut t, &mut spoken, &no[..1]);
+    assert!(
+        shared.iter().all(|u| u.branch_choice.is_none()),
+        "must not pick an option on text both options share"
+    );
+    let own = read_partials(&mut t, &mut spoken, &no[1..]);
+    let picked = own.iter().find_map(|u| u.branch_choice.clone()).expect("NO should be picked");
+    assert_eq!(picked.option_label, "NO");
+    assert!(matches!(own.last().unwrap().state, TrackState::InBranch { .. }));
+    let back = read_partials(&mut t, &mut spoken, &main[trigger + 1..trigger + 2]);
+    let last = back.last().unwrap();
+    assert!(matches!(last.state, TrackState::Speaking), "should be back on the main line");
+    assert_eq!(last.sentence_index, trigger + 1);
+}
+
+/// Skipping the branch and reading straight on into the Closing selects no
+/// option and keeps tracking the main line.
+#[test]
+fn skipping_a_branch_selects_nothing() {
+    let (mut t, main, _, _) = mtm_branch_setup();
+    let trigger = main.iter().position(|s| s.contains("Prevnar")).unwrap();
+    let mut spoken = String::new();
+    let ups = read_partials(&mut t, &mut spoken, &main[trigger - 2..trigger + 3]);
+    assert!(ups.iter().all(|u| u.branch_choice.is_none()));
+    assert!(t.preview_position() >= trigger + 2, "kept tracking the main line");
+}
+
+/// Replay of a real live read (Sept 23 retest) that goes into the YES answer
+/// without saying the question: YES is picked from the answer's own words, the
+/// highlight moves to the answer's second sentence, and the cursor returns to
+/// the main line at "Thank you for listening".
+#[test]
+fn real_read_follows_into_a_branch_answer_and_back() {
+    use prompter_core::{recent_words, ScriptTracker, SpeechUpdate, TimelineStep, TrackState};
+    let rec = include_str!("fixtures/lighthouse-branch.recording.jsonl");
+    let mut tracker: Option<ScriptTracker> = None;
+    let mut picked = None;
+    let mut answer_timelines = Vec::new();
+    let mut seen_in_answer = Vec::new();
+    let mut returned_to = None;
+    for line in rec.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        match v["type"].as_str() {
+            Some("script") => {
+                let parsed = script::parse(v["source"].as_str().unwrap()).unwrap();
+                let mut t = ScriptTracker::new(&parsed);
+                t.set_window_radius(10);
+                answer_timelines = t
+                    .timeline()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| matches!(s, TimelineStep::BranchSentence { option_label, .. } if option_label == "YES"))
+                    .map(|(i, _)| i)
+                    .collect();
+                tracker = Some(t);
+            }
+            Some("asr") => {
+                let u = tracker.as_mut().unwrap().observe(&SpeechUpdate {
+                    text: recent_words(v["text"].as_str().unwrap(), 10),
+                    words: Vec::new(),
+                    is_final: v["final"].as_bool().unwrap_or(false),
+                });
+                if let Some(c) = &u.branch_choice {
+                    picked = Some(c.option_label.clone());
+                }
+                if matches!(u.state, TrackState::InBranch { .. }) {
+                    seen_in_answer.push(u.timeline_index);
+                } else if picked.is_some() && returned_to.is_none() {
+                    returned_to = Some(u.sentence_index);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(picked.as_deref(), Some("YES"));
+    assert_eq!(seen_in_answer.first(), answer_timelines.first(), "starts on the answer's first sentence");
+    assert!(seen_in_answer.contains(&answer_timelines[1]), "follows to the answer's second sentence");
+    assert_eq!(returned_to, Some(14), "returns at 'Thank you for listening'");
+}
+
+/// Replay of a real live read (Sept 23): after "Years later, the captain of that
+/// boat..." the reader skips the rest of the section (and the question) and
+/// reads the YES answer. The answer is recognized from a few sentences before
+/// the branch and followed to its second sentence.
+#[test]
+fn real_read_skipping_into_an_answer_is_followed() {
+    use prompter_core::{recent_words, ScriptTracker, SpeechUpdate, TrackState};
+    let rec = include_str!("fixtures/lighthouse-skip-into-answer.recording.jsonl");
+    let mut tracker: Option<ScriptTracker> = None;
+    let mut picked = None;
+    let mut last_in_answer = None;
+    for line in rec.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        match v["type"].as_str() {
+            Some("script") => {
+                let parsed = script::parse(v["source"].as_str().unwrap()).unwrap();
+                let mut t = ScriptTracker::new(&parsed);
+                t.set_window_radius(10);
+                tracker = Some(t);
+            }
+            Some("asr") => {
+                let u = tracker.as_mut().unwrap().observe(&SpeechUpdate {
+                    text: recent_words(v["text"].as_str().unwrap(), 10),
+                    words: Vec::new(),
+                    is_final: v["final"].as_bool().unwrap_or(false),
+                });
+                if let Some(c) = &u.branch_choice {
+                    picked = Some((c.option_label.clone(), v["t"].as_u64().unwrap()));
+                }
+                if matches!(u.state, TrackState::InBranch { .. }) {
+                    last_in_answer = Some(u.timeline_index);
+                }
+            }
+            _ => {}
+        }
+    }
+    let (label, at) = picked.expect("the YES answer should be recognized");
+    assert_eq!(label, "YES");
+    assert!(at < 103_000, "picked late, at {at}ms (answer starts ~100.5s)");
+    // Timeline of the YES answer's second sentence in this script.
+    assert_eq!(last_in_answer, Some(20), "followed to the answer's second sentence");
+}

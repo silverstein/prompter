@@ -28,7 +28,7 @@
 
 use crate::align::{self, AlignmentEngine};
 use crate::script::{Directive, Element, Script};
-use crate::speech::SpeechUpdate;
+use crate::speech::{recent_words, SpeechUpdate};
 use std::collections::HashMap;
 
 /// Minimum margin by which the best branch option must beat the runner-up to be
@@ -50,6 +50,13 @@ const RELOCATE_MIN_CONFIDENCE: f32 = 0.8;
 /// ...agreed on by this many successive updates that keep reading forward in
 /// the same passage. One coincidental phrase can never move the cursor.
 const RELOCATE_AGREEMENT: u8 = 3;
+
+/// Picking a branch option from live reading: the last few recognized words
+/// are matched against each option (and the main line) ...
+const BRANCH_TAIL_WORDS: usize = 5;
+/// ...and an option is chosen once at least this many of them match it, more
+/// than match any other option or the nearby main line.
+const BRANCH_MIN_WORDS: usize = 3;
 
 /// One step in the flattened script timeline. Indices into the slice returned by
 /// [`ScriptTracker::timeline`] are stable for the life of the tracker.
@@ -130,6 +137,8 @@ struct RelocateCandidate {
 }
 
 struct BranchData {
+    /// Main sentence the branch follows (`None` if the script opens with it).
+    trigger: Option<usize>,
     question: String,
     option_labels: Vec<String>,
     options: Vec<BranchOptionData>,
@@ -141,6 +150,11 @@ struct BranchOptionData {
     label: String,
     joined: String,
     first_timeline: Option<usize>,
+    /// Timeline index of each of the option's sentences.
+    timelines: Vec<usize>,
+    /// Aligner over just this option's sentences (`None` if it has none): picks
+    /// the option from live reading and follows the reader through it.
+    engine: Option<AlignmentEngine>,
 }
 
 /// The tracker's position in the branch tree.
@@ -166,6 +180,8 @@ pub struct ScriptTracker {
     committed_timeline: usize,
     committed_state: TrackState,
     relocate: Option<RelocateCandidate>,
+    /// Sentence being read within the selected branch option.
+    option_pos: usize,
 }
 
 impl ScriptTracker {
@@ -214,10 +230,12 @@ impl ScriptTracker {
                         let mut option_data = Vec::new();
                         for option in options {
                             let mut first_timeline = None;
+                            let mut timelines = Vec::new();
                             for sentence in &option.sentences {
                                 if first_timeline.is_none() {
                                     first_timeline = Some(timeline.len());
                                 }
+                                timelines.push(timeline.len());
                                 timeline.push(TimelineStep::BranchSentence {
                                     option_label: option.label.clone(),
                                     text: sentence.text.clone(),
@@ -232,9 +250,18 @@ impl ScriptTracker {
                                     .collect::<Vec<_>>()
                                     .join(" "),
                                 first_timeline,
+                                timelines,
+                                engine: (!option.sentences.is_empty()).then(|| {
+                                    let mut e = AlignmentEngine::new(
+                                        option.sentences.iter().map(|s| s.text.clone()).collect(),
+                                    );
+                                    e.set_window_radius(option.sentences.len());
+                                    e
+                                }),
                             });
                         }
                         branches.push(BranchData {
+                            trigger: last_main,
                             question: question.clone(),
                             option_labels: options.iter().map(|o| o.label.clone()).collect(),
                             options: option_data,
@@ -264,6 +291,7 @@ impl ScriptTracker {
             committed_timeline,
             committed_state: TrackState::Speaking,
             relocate: None,
+            option_pos: 0,
         }
     }
 
@@ -333,25 +361,9 @@ impl ScriptTracker {
     }
 
     fn observe_final(&mut self, text: &str) -> TrackUpdate {
-        // Inside a branch: watch for the return to the main line.
+        // Inside a branch: follow the option, watch for the return to the main line.
         if let Mode::InBranch { branch, option } = self.mode {
-            if let Some(pm) = self.branches[branch].post_main {
-                if align::similarity(text, &self.main_sentences[pm]) >= align::MATCH_THRESHOLD {
-                    self.engine.set_position(pm);
-                    self.commit_linear();
-                    return self.committed_update(true, None);
-                }
-            }
-            // Still on the option: it is evidence only if it matches the option.
-            let opt = &self.branches[branch].options[option];
-            let matched = align::similarity(text, &opt.joined) >= align::MATCH_THRESHOLD;
-            let label = opt.label.clone();
-            let ti = opt.first_timeline.unwrap_or(self.committed_timeline);
-            self.committed_timeline = ti;
-            self.committed_state = TrackState::InBranch {
-                option_label: label,
-            };
-            return self.committed_update(matched, None);
+            return self.observe_in_branch(branch, option, text, true);
         }
 
         // Awaiting a branch decision: try to pick an option.
@@ -361,10 +373,17 @@ impl ScriptTracker {
             }
             // No option chosen -> fall through to main alignment.
         }
+        for branch in self.upcoming_branches() {
+            if let Some(selected) = self.try_select_by_reading(branch, text) {
+                return selected;
+            }
+        }
 
-        // Nothing local: give the whole-script relocator a look before the
-        // aligner records a miss.
-        if !self.engine.peek(text).matched {
+        // Nothing local, or a match behind the cursor (going back to re-read):
+        // give the whole-script relocator a look before the aligner records a
+        // miss. The aligner only takes small back-jumps on its own.
+        let peek = self.engine.peek(text);
+        if !peek.matched || peek.position < self.committed.max(self.preview) {
             if let Some(u) = self.try_relocate(text) {
                 return u;
             }
@@ -402,34 +421,47 @@ impl ScriptTracker {
     }
 
     fn observe_partial(&mut self, text: &str) -> TrackUpdate {
-        if let Mode::InBranch { branch, .. } = self.mode {
-            // Detect the return to the main line from a partial. Without this,
-            // a partials-only provider leaves the cursor pinned in the branch
-            // forever once the speaker resumes the script (the same freeze class
-            // as the linear path -- finals may never arrive). `post_main` is a
-            // specific sentence gated by the match threshold, so promoting this
-            // transition on a confident partial is safe.
-            if let Some(pm) = self.branches[branch].post_main {
-                if align::similarity(text, &self.main_sentences[pm]) >= align::MATCH_THRESHOLD {
-                    self.engine.set_position(pm);
-                    self.commit_linear();
-                    return self.committed_update(true, None);
-                }
+        if let Mode::InBranch { branch, option } = self.mode {
+            // Partials matter here as much as on the main line: a partials-only
+            // provider (Apple) may never send a final inside the branch.
+            return self.observe_in_branch(branch, option, text, false);
+        }
+        // Reached a branch point: pick the option the speaker starts reading.
+        // Selection needs words unique to one option (see
+        // `try_select_by_reading`), so reading on into the main line instead
+        // (skipping the branch) never selects anything.
+        // A branch coming up within a few sentences: the speaker may skip the
+        // rest of the lead-in and go straight into an answer.
+        for branch in self.upcoming_branches() {
+            if let Some(selected) = self.try_select_by_reading(branch, text) {
+                return selected;
             }
-            // Still on the branch option: no main-line preview to offer.
-            return TrackUpdate {
-                sentence_index: self.committed,
-                timeline_index: self.committed_timeline,
-                committed: false,
-                matched: false,
-                confidence: 0.0,
-                state: self.committed_state.clone(),
-                branch_choice: None,
-                relocated: false,
-            };
+        }
+        if let Mode::AwaitingBranch { branch } = self.mode {
+            // Reading an answer we can't pin to one option yet (text several
+            // options share): hold at the branch rather than letting a
+            // coincidental main-line match carry the cursor past it.
+            if self.reading_an_option(branch, text) {
+                return TrackUpdate {
+                    sentence_index: self.preview,
+                    timeline_index: self.main_to_timeline.get(self.preview).copied().unwrap_or(0),
+                    committed: false,
+                    matched: false,
+                    confidence: 0.0,
+                    state: self.linear_state_at(self.preview),
+                    branch_choice: None,
+                    relocated: false,
+                };
+            }
         }
         let result = self.engine.peek(text);
-        if !result.matched {
+        // A match behind the live cursor is going back to re-read. Partials
+        // never move the cursor backward on their own (that would let a revised
+        // hypothesis flicker it back), so the backward move goes through the
+        // relocator's agreement gate instead. Without this, going back fewer
+        // sentences than the window radius was followed by nothing: the peek
+        // matched (so the relocator never ran) but partials are forward-only.
+        if !result.matched || result.position < self.preview {
             if let Some(u) = self.try_relocate(text) {
                 return u;
             }
@@ -456,6 +488,12 @@ impl ScriptTracker {
                 self.engine.set_position(self.preview);
             }
         }
+        // Arm (or disarm) branch selection from the live cursor: with partials
+        // only, `commit_linear` (which sets this on finals) may never run.
+        self.mode = match self.branch_after.get(&self.preview) {
+            Some(&branch) => Mode::AwaitingBranch { branch },
+            None => Mode::Linear,
+        };
         let timeline_index = self
             .main_to_timeline
             .get(self.preview)
@@ -490,13 +528,19 @@ impl ScriptTracker {
             self.relocate = None;
             return None;
         };
-        if hit.matched_words < RELOCATE_MIN_WORDS || hit.confidence < RELOCATE_MIN_CONFIDENCE {
+        // Repeated text is no evidence of WHICH copy is being read: hold until
+        // the words past the repeat pick one out.
+        if hit.ambiguous
+            || hit.matched_words < RELOCATE_MIN_WORDS
+            || hit.confidence < RELOCATE_MIN_CONFIDENCE
+        {
             self.relocate = None;
             return None;
         }
-        // Near the cursor the local aligner is in charge.
+        // Just ahead of the cursor the local aligner is in charge. Anything
+        // behind it, however close, needs agreement: partials only move forward.
         let cur = self.committed.max(self.preview);
-        if hit.sentence + 3 >= cur && hit.sentence <= cur + MAX_ADVANCE {
+        if hit.sentence >= cur && hit.sentence <= cur + MAX_ADVANCE {
             self.relocate = None;
             return None;
         }
@@ -529,6 +573,188 @@ impl ScriptTracker {
 
     /// Try to select an option of `branch` from `text`; on success transition to
     /// `InBranch` and return the selecting update.
+    /// Branches whose question comes at most [`MAX_ADVANCE`] sentences after the
+    /// live cursor, nearest first (the one we're at, if any, comes first).
+    fn upcoming_branches(&self) -> Vec<usize> {
+        let cur = self.committed.max(self.preview);
+        let mut v: Vec<(usize, usize)> = self
+            .branches
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                let t = b.trigger?;
+                (t >= cur && t <= cur + MAX_ADVANCE).then_some((t, i))
+            })
+            .collect();
+        v.sort();
+        v.into_iter().map(|(_, i)| i).collect()
+    }
+
+    /// Choose a branch option by hand (the operator clicked it): the tracker
+    /// follows the reader from the start of that option.
+    pub fn choose_branch(&mut self, branch: usize, option: usize) {
+        let Some(b) = self.branches.get_mut(branch) else { return };
+        let Some(opt) = b.options.get_mut(option) else { return };
+        if let Some(e) = opt.engine.as_mut() {
+            e.set_position(0);
+        }
+        let ti = opt.timelines.first().copied();
+        let label = opt.label.clone();
+        if let Some(t) = b.trigger {
+            self.engine.set_position(t);
+            self.committed = t;
+            self.preview = t;
+        }
+        self.relocate = None;
+        self.mode = Mode::InBranch { branch, option };
+        self.option_pos = 0;
+        if let Some(ti) = ti {
+            self.committed_timeline = ti;
+        }
+        self.committed_state = TrackState::InBranch { option_label: label };
+    }
+
+    /// The latest words match some option of `branch` at least as well as the
+    /// nearby main line.
+    fn reading_an_option(&self, branch: usize, text: &str) -> bool {
+        let tail = recent_words(text, BRANCH_TAIL_WORDS);
+        let strength = |h: Option<align::GlobalHit>| {
+            h.filter(|h| h.confidence >= RELOCATE_MIN_CONFIDENCE)
+                .map_or(0, |h| h.matched_words)
+        };
+        let in_option = self.branches[branch]
+            .options
+            .iter()
+            .filter_map(|o| o.engine.as_ref())
+            .map(|e| strength(e.locate_global(&tail)))
+            .max()
+            .unwrap_or(0);
+        in_option >= BRANCH_MIN_WORDS && in_option >= strength(self.engine.locate_local(&tail))
+    }
+
+    /// Pick the option the speaker has started reading: the last few words
+    /// must match one option better than every other option and better than
+    /// the nearby main line. Text shared by several options (a common closing
+    /// line) selects nothing until words unique to one are heard.
+    fn try_select_by_reading(&mut self, branch: usize, text: &str) -> Option<TrackUpdate> {
+        let tail = recent_words(text, BRANCH_TAIL_WORDS);
+        let strength = |h: Option<align::GlobalHit>| {
+            h.filter(|h| h.confidence >= RELOCATE_MIN_CONFIDENCE)
+                .map_or(0, |h| h.matched_words)
+        };
+        let main = strength(self.engine.locate_local(&tail));
+        let mut best: Option<(usize, usize, align::GlobalHit)> = None; // (option, words, hit)
+        let mut runner_up = 0;
+        for (i, opt) in self.branches[branch].options.iter().enumerate() {
+            let Some(engine) = &opt.engine else { continue };
+            let hit = engine.locate_global(&tail);
+            let words = strength(hit);
+            match best {
+                Some((_, bw, _)) if words <= bw => runner_up = runner_up.max(words),
+                _ => {
+                    runner_up = runner_up.max(best.map_or(0, |b| b.1));
+                    best = hit.map(|h| (i, words, h));
+                }
+            }
+        }
+        let (option, words, hit) = best?;
+        if words < BRANCH_MIN_WORDS || words <= runner_up || words <= main {
+            return None;
+        }
+        let pos = hit.sentence;
+        let opt = &mut self.branches[branch].options[option];
+        if let Some(e) = opt.engine.as_mut() {
+            e.set_position(pos);
+        }
+        let label = opt.label.clone();
+        let ti = opt.timelines.get(pos).copied().unwrap_or(self.committed_timeline);
+        let question = self.branches[branch].question.clone();
+        self.mode = Mode::InBranch { branch, option };
+        // Reaching the branch confirms the main line up to it (with partials
+        // only, `committed` may still be far behind the live cursor), including
+        // when the speaker skipped the end of the lead-in.
+        let at = self.committed.max(self.preview).max(self.branches[branch].trigger.unwrap_or(0));
+        self.engine.set_position(at);
+        self.committed = at;
+        self.preview = at;
+        self.option_pos = pos;
+        self.committed_timeline = ti;
+        self.committed_state = TrackState::InBranch {
+            option_label: label.clone(),
+        };
+        Some(self.committed_update(
+            true,
+            Some(BranchChoice {
+                question,
+                option_label: label,
+            }),
+        ))
+    }
+
+    /// Inside a selected option: follow the reader through its sentences
+    /// (forward only), and return to the main line once they read on past the
+    /// branch.
+    fn observe_in_branch(&mut self, branch: usize, option: usize, text: &str, is_final: bool) -> TrackUpdate {
+        if let Some(pm) = self.branches[branch].post_main {
+            // Back on the main line: the post-branch sentence as a whole, or the
+            // latest words matching the main line at or past it (more strongly
+            // than they match the option).
+            let tail = recent_words(text, BRANCH_TAIL_WORDS);
+            let main = self
+                .engine
+                .locate_local(&tail)
+                .filter(|h| h.sentence >= pm && h.confidence >= RELOCATE_MIN_CONFIDENCE);
+            let in_option = self.branches[branch].options[option]
+                .engine
+                .as_ref()
+                .and_then(|e| e.locate_global(&tail))
+                .map_or(0, |h| h.matched_words);
+            let resume = match main {
+                Some(h) if h.matched_words >= BRANCH_MIN_WORDS && h.matched_words > in_option => {
+                    Some(h.sentence)
+                }
+                // Whole-sentence similarity is loose (shared words give partial
+                // credit), so only trust it once the latest words have left the
+                // option.
+                _ if in_option < BRANCH_MIN_WORDS
+                    && align::similarity(text, &self.main_sentences[pm]) >= align::MATCH_THRESHOLD =>
+                {
+                    Some(pm)
+                }
+                _ => None,
+            };
+            if let Some(at) = resume {
+                self.engine.set_position(at);
+                self.commit_linear();
+                return self.committed_update(true, None);
+            }
+        }
+        // Still on the option: advance through its sentences.
+        let opt = &mut self.branches[branch].options[option];
+        let peek = opt.engine.as_ref().map(|e| e.peek(text));
+        let matched = peek.as_ref().is_some_and(|r| r.matched);
+        if let Some(r) = peek.filter(|r| r.matched) {
+            let capped = r.position.min(self.option_pos + MAX_ADVANCE);
+            if capped > self.option_pos {
+                self.option_pos = capped;
+                if let Some(e) = opt.engine.as_mut() {
+                    e.set_position(capped);
+                }
+            }
+        }
+        self.committed_timeline = opt
+            .timelines
+            .get(self.option_pos)
+            .copied()
+            .unwrap_or(self.committed_timeline);
+        self.committed_state = TrackState::InBranch {
+            option_label: opt.label.clone(),
+        };
+        let mut u = self.committed_update(matched, None);
+        u.committed = is_final;
+        u
+    }
+
     fn try_select(&mut self, branch: usize, text: &str) -> Option<TrackUpdate> {
         let option = self.choose_option(branch, text)?;
         let opt = &self.branches[branch].options[option];
@@ -536,6 +762,10 @@ impl ScriptTracker {
         let ti = opt.first_timeline.unwrap_or(self.committed_timeline);
         let question = self.branches[branch].question.clone();
         self.mode = Mode::InBranch { branch, option };
+        self.option_pos = 0;
+        if let Some(e) = self.branches[branch].options[option].engine.as_mut() {
+            e.set_position(0);
+        }
         self.committed_timeline = ti;
         self.committed_state = TrackState::InBranch {
             option_label: label.clone(),
@@ -845,13 +1075,52 @@ mod tests {
     }
 
     #[test]
-    fn does_not_advance_into_a_future_branch_option() {
+    fn reading_an_upcoming_answer_skips_to_it() {
+        // The branch is two sentences ahead: skipping the rest of the lead-in
+        // and reading an answer goes straight into that answer.
         let mut t = ScriptTracker::new(&sample_script());
         let u = t.observe(&SpeechUpdate::finalized(
             "great lets discuss your concerns in detail",
         ));
-        assert_eq!(t.position(), 0);
+        assert_eq!(u.branch_choice.map(|c| c.option_label).as_deref(), Some("YES"));
+        assert_eq!(t.position(), 2, "main cursor moves up to the branch point");
+    }
+
+    #[test]
+    fn a_far_away_branch_answer_is_not_jumped_to() {
+        // Same answer text, but the branch is many sentences ahead.
+        let mut sentences: Vec<Sentence> = (0..12).map(|i| sent(&sentence_text(i))).collect();
+        let lead = sentences.split_off(1);
+        let script = script_from(vec![Section {
+            name: "Body".into(),
+            word_count: 0,
+            elements: vec![
+                Element::Text(sentences),
+                Element::Text(lead),
+                Element::Directive(Directive::Branch {
+                    question: "any questions".into(),
+                    options: vec![BranchOption {
+                        label: "YES".into(),
+                        sentences: vec![sent("great lets discuss your concerns in detail")],
+                    }],
+                }),
+            ],
+        }]);
+        let mut t = ScriptTracker::new(&script);
+        let u = t.observe(&SpeechUpdate::partial("great lets discuss your concerns in detail"));
         assert!(u.branch_choice.is_none());
+        assert_eq!(t.preview_position(), 0);
+    }
+
+    #[test]
+    fn choosing_a_branch_by_hand_follows_that_answer() {
+        let mut t = ScriptTracker::new(&sample_script());
+        t.choose_branch(0, 1);
+        let u = t.observe(&SpeechUpdate::partial("okay then lets keep moving"));
+        assert_eq!(u.state, TrackState::InBranch { option_label: "NO".into() });
+        let u = t.observe(&SpeechUpdate::partial("does this make sense so far for you"));
+        assert_eq!(u.state, TrackState::Speaking, "returns to the main line after the answer");
+        assert_eq!(u.sentence_index, 3);
     }
 
     #[test]
@@ -929,6 +1198,113 @@ mod tests {
         let u = t.observe(&SpeechUpdate::partial(sentence_text(30)));
         assert!(!u.relocated, "agreement must be consecutive and progressing");
         assert!(t.preview_position() <= 2);
+    }
+
+    #[test]
+    fn going_back_a_few_sentences_is_followed() {
+        // Within the window: the local peek matches behind the cursor, which
+        // partials alone never followed (the live Sept 23 read).
+        let mut t = ScriptTracker::new(&long_script(30));
+        t.set_window_radius(10);
+        let mut spoken = String::new();
+        for i in 0..10 {
+            for k in 0..6 {
+                spoken.push(' ');
+                spoken.push_str(&w(i, k));
+                t.observe(&SpeechUpdate::partial(recent_words(&spoken, 10)));
+            }
+        }
+        assert_eq!(t.preview_position(), 9);
+        // Go back to sentence 6 without pausing and keep reading.
+        let mut moved = None;
+        'read: for i in 6..9 {
+            for k in 0..6 {
+                spoken.push(' ');
+                spoken.push_str(&w(i, k));
+                let u = t.observe(&SpeechUpdate::partial(recent_words(&spoken, 10)));
+                if u.relocated {
+                    moved = Some(u.sentence_index);
+                    break 'read;
+                }
+            }
+        }
+        let at = moved.expect("going back should be followed");
+        assert!((6..=7).contains(&at), "relocated to {at}");
+    }
+
+    /// A script where sentence `dup` repeats sentence `orig` word for word. The
+    /// repeated sentence is 12 words, long enough that the relocator would get
+    /// several agreeing updates while only the repeated words are heard.
+    fn script_with_repeat(n: usize, orig: usize, dup: usize) -> Script {
+        let long = format!("{} {}", sentence_text(orig), sentence_text(orig + 50));
+        let sentences: Vec<Sentence> = (0..n)
+            .map(|i| if i == orig || i == dup { sent(&long) } else { sent(&sentence_text(i)) })
+            .collect();
+        script_from(vec![Section {
+            name: "Body".into(),
+            word_count: 0,
+            elements: vec![Element::Text(sentences)],
+        }])
+    }
+
+    /// Read sentences `from..to` word by word as Apple-style partials (last 10
+    /// words), returning the first relocation target.
+    fn read_until_relocated(t: &mut ScriptTracker, script: &Script, from: usize, to: usize) -> Option<usize> {
+        let texts: Vec<String> = match &script.sections[0].elements[0] {
+            Element::Text(ss) => ss.iter().map(|s| s.text.clone()).collect(),
+            _ => unreachable!(),
+        };
+        let mut spoken = String::new();
+        for text in &texts[from..to] {
+            for word in text.split_whitespace() {
+                spoken.push(' ');
+                spoken.push_str(word);
+                let u = t.observe(&SpeechUpdate::partial(recent_words(&spoken, 10)));
+                if u.relocated {
+                    return Some(u.sentence_index);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn going_back_to_a_repeated_sentence_picks_the_one_being_read() {
+        // Sentence 13 repeats sentence 3. From 16, go back and re-read 13 then
+        // 14: the cursor must land on 13/14, never on the far copy at 3.
+        let script = script_with_repeat(30, 3, 13);
+        let mut t = ScriptTracker::new(&script);
+        t.set_window_radius(10);
+        t.set_position(16);
+        let at = read_until_relocated(&mut t, &script, 13, 16).expect("should follow the re-read");
+        assert!((13..=14).contains(&at), "relocated to {at}");
+    }
+
+    #[test]
+    fn going_back_to_the_first_copy_of_a_repeat_is_followed() {
+        // Same script; this time go back to the FIRST copy (3) and read on into
+        // 4: once the words after the repeat are heard, it lands on 3/4.
+        let script = script_with_repeat(30, 3, 13);
+        let mut t = ScriptTracker::new(&script);
+        t.set_window_radius(10);
+        t.set_position(16);
+        let at = read_until_relocated(&mut t, &script, 3, 6).expect("should follow the re-read");
+        assert!((3..=4).contains(&at), "relocated to {at}");
+    }
+
+    #[test]
+    fn one_backward_coincidence_does_not_move_the_cursor() {
+        let mut t = ScriptTracker::new(&long_script(30));
+        t.set_window_radius(10);
+        t.set_position(9);
+        let u = t.observe(&SpeechUpdate::partial(sentence_text(6)));
+        assert!(!u.relocated);
+        // Back to reading forward: the lone backward hit is forgotten.
+        let u = t.observe(&SpeechUpdate::partial(sentence_text(9)));
+        assert!(!u.relocated);
+        let u = t.observe(&SpeechUpdate::partial(sentence_text(6)));
+        assert!(!u.relocated);
+        assert_eq!(t.preview_position(), 9);
     }
 
     #[test]
