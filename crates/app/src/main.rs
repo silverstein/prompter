@@ -126,6 +126,9 @@ static AUDIO_STOP: std::sync::LazyLock<Arc<AtomicBool>> =
 /// PID of the running speech helper (0 = none), so stop can signal it directly
 /// instead of waiting for its next output line.
 static SPEECH_PID: AtomicU32 = AtomicU32::new(0);
+/// True while a post-session recording check runs (an update must not restart
+/// the app under it).
+static VERIFYING: AtomicBool = AtomicBool::new(false);
 /// True while the other party (call audio) is speaking.
 static OTHER_SPEAKING: AtomicBool = AtomicBool::new(false);
 
@@ -486,9 +489,11 @@ fn finish_tracking(
     match audio {
         Some(audio) => {
             let session_dir = session.session_dir.clone();
+            VERIFYING.store(true, Ordering::SeqCst);
             std::thread::spawn(move || {
                 let started = Instant::now();
                 let result = verify_with_recording(&mut session, &audio, duration_secs, &section_times, &path);
+                VERIFYING.store(false, Ordering::SeqCst);
                 log_verification(duration_secs, started.elapsed().as_secs_f32(), &result);
                 if !load_settings().keep_session_audio {
                     if let Some(d) = session_dir {
@@ -1274,6 +1279,64 @@ fn screen_share_label(hidden: bool) -> &'static str {
     }
 }
 
+// ── Updates ──
+// Checked once at launch against the release feed (latest.json, signed with
+// the Prompter updater key). The UI offers the update outside sessions only;
+// installing restarts the app, so it's refused mid-session or mid-check.
+
+#[derive(Clone, Serialize)]
+struct UpdateInfo {
+    version: String,
+    notes: Option<String>,
+}
+
+fn check_for_update(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        use tauri_plugin_updater::UpdaterExt;
+        let Ok(updater) = app.updater() else { return };
+        match updater.check().await {
+            Ok(Some(u)) => {
+                let _ = app.emit(
+                    "update-available",
+                    UpdateInfo {
+                        version: u.version.clone(),
+                        notes: u.body.clone(),
+                    },
+                );
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("[prompter] update check failed: {e}"),
+        }
+    });
+}
+
+#[tauri::command]
+async fn install_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, TrackingState>,
+) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let in_session = state.0.lock().map(|s| s.is_some()).unwrap_or(true);
+    if in_session || AUDIO_RUNNING.load(Ordering::SeqCst) {
+        return Err("Finish the session first.".into());
+    }
+    if VERIFYING.load(Ordering::SeqCst) {
+        return Err("Still checking the last session's recording; try again in a moment.".into());
+    }
+    let update = app
+        .updater()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("Prompter is up to date.")?;
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+    app.restart();
+}
+
 /// Diagnostic mode: `Prompter --transcribe-file <audio> --script <md> --out <json>`
 /// runs the speech helper's file mode (the post-session check) and writes its
 /// output, without opening a window. It has to go through the app because
@@ -1317,10 +1380,13 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(TrackingState::default())
         .manage(ScreenShareItem::default())
         .setup(|app| {
             use tauri::Listener;
+
+            check_for_update(app.handle().clone());
 
             // Menu-bar tray with the screen-share visibility toggle. The window
             // is content-protected (hidden from screenshots / screen-share /
@@ -1415,6 +1481,7 @@ fn main() {
             add_recent_script,
             set_always_on_top,
             set_hide_from_screen_share,
+            install_update,
             list_available_scripts
         ])
         .run(tauri::generate_context!())

@@ -10,6 +10,10 @@
 <body>
 <div class="titlebar" data-tauri-drag-region></div>
 <div class="error-bar" id="err"></div>
+<div class="update-bar" id="updateBar">
+  <span id="updateText"></span>
+  <button class="btn-ghost" id="updateBtn">Install and restart</button>
+</div>
 <div class="nav" id="nav"></div>
 
 <div class="empty" id="empty">
@@ -1124,6 +1128,18 @@ async function bindSessionOptions(){
   });
 }
 bindSessionOptions();
+
+// Updates: offered only outside a session (the bar is hidden in focus mode and
+// Rust refuses to install mid-session); installing restarts Prompter.
+listen('update-available', e=>{
+  $('updateText').textContent = 'Prompter ' + e.payload.version + ' is available.';
+  $('updateBar').classList.add('show');
+});
+$('updateBtn').addEventListener('click', async ()=>{
+  const b = $('updateBtn'); b.disabled = true; b.textContent = 'Installing\u2026';
+  try{ await invoke('install_update'); }
+  catch(err){ showErr('Update: ' + err); b.disabled = false; b.textContent = 'Install and restart'; }
+});
 
 // Screen-share hiding goes through Rust (it changes the window, and keeps the
 // menu-bar item in sync); unset means hidden.

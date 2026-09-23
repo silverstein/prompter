@@ -1,0 +1,245 @@
+name: Release macOS
+
+# Builds, signs (Developer ID), notarizes and staples Prompter.app, packages a
+# notarized DMG, signs the updater bundle, and publishes them with latest.json
+# (the in-app updater's feed) on the tag's GitHub release. Adapted from the
+# Minutes release workflow.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build, for example v0.2.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+  TAURI_CLI_VERSION: "2.10.1"
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  macos-release:
+    name: Build signed + notarized Prompter.app
+    runs-on: macos-latest
+    steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: release input must be an exact version tag" >&2
+            exit 1
+          fi
+
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ format('refs/tags/{0}', env.RELEASE_TAG) }}
+
+      - name: Check the tag matches the app version
+        run: |
+          set -euo pipefail
+          app_version="$(python3 -c 'import json; print(json.load(open("crates/app/tauri.conf.json"))["version"])')"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "v$app_version" != "$RELEASE_TAG" ] || [ "v$cargo_version" != "$RELEASE_TAG" ]; then
+            echo "ERROR: tag $RELEASE_TAG but tauri.conf.json=$app_version Cargo.toml=$cargo_version" >&2
+            exit 1
+          fi
+
+      - name: Validate signing, notarization and updater secrets
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          missing=()
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                      APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY \
+                      TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required release secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked
+
+      - name: Run core tests
+        run: cargo test -p prompter-core --locked
+
+      - name: Materialize App Store Connect key
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" > "$key_path"
+          chmod 600 "$key_path"
+          echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
+      - name: Import Developer ID identity into an ephemeral keychain
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/prompter-release.keychain-db"
+          certificate="$RUNNER_TEMP/prompter-release.p12"
+          keychain_password="$(openssl rand -hex 24)"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+          security find-identity -v -p codesigning "$keychain" | grep -Fq "$APPLE_SIGNING_IDENTITY"
+          echo "PROMPTER_RELEASE_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Build app (Swift speech helper + Tauri bundle)
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: ./scripts/build.sh
+
+      - name: Sign inside-out, notarize and staple the app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          app="target/release/bundle/macos/Prompter.app"
+          helper="$app/Contents/MacOS/speech-recognizer"
+          file "$helper" | grep -q "Mach-O" || { echo "ERROR: speech helper missing from bundle" >&2; exit 1; }
+
+          codesign --force --options runtime --timestamp \
+            --entitlements crates/app/Entitlements.plist \
+            --sign "$APPLE_SIGNING_IDENTITY" "$helper"
+          codesign --force --options runtime --timestamp \
+            --entitlements crates/app/Entitlements.plist \
+            --sign "$APPLE_SIGNING_IDENTITY" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          # The hardened runtime silences the microphone without this.
+          codesign -d --entitlements :- "$helper" 2>/dev/null | grep -q "com.apple.security.device.audio-input"
+
+          notary_zip="$RUNNER_TEMP/Prompter-notary.zip"
+          ditto -c -k --keepParent "$app" "$notary_zip"
+          xcrun notarytool submit "$notary_zip" \
+            --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+
+      - name: Sign the updater bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          updater="target/release/bundle/macos/Prompter.app.tar.gz"
+          rm -f "$updater" "$updater.sig"
+          tar -C target/release/bundle/macos -czf "$updater" Prompter.app
+          cargo tauri signer sign "$updater"
+          test -s "$updater.sig"
+
+      - name: Create, sign, notarize and staple the DMG
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          dmg="target/release/bundle/dmg/Prompter_${RELEASE_TAG#v}_aarch64.dmg"
+          ./scripts/make-dmg.sh target/release/bundle/macos/Prompter.app "$dmg"
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
+          xcrun notarytool submit "$dmg" \
+            --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+
+      - name: Remove ephemeral signing material
+        if: always()
+        run: |
+          if [ -n "${PROMPTER_RELEASE_KEYCHAIN:-}" ]; then
+            security delete-keychain "$PROMPTER_RELEASE_KEYCHAIN" || true
+          fi
+          rm -f "${APPLE_API_KEY_PATH:-}" "$RUNNER_TEMP/prompter-release.p12" "$RUNNER_TEMP/Prompter-notary.zip"
+
+      - name: Ensure the GitHub release exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --title "Prompter $RELEASE_TAG" --generate-notes --verify-tag
+
+      - name: Generate latest.json for the in-app updater
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          export UPDATE_VERSION="${RELEASE_TAG#v}"
+          export UPDATE_SIG="$(cat target/release/bundle/macos/Prompter.app.tar.gz.sig)"
+          export UPDATE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/Prompter.app.tar.gz"
+          export UPDATE_NOTES="$(gh release view "$RELEASE_TAG" --json body -q .body 2>/dev/null || true)"
+          python3 - <<'PY'
+          import datetime, json, os
+          data = {
+              "version": os.environ["UPDATE_VERSION"],
+              "notes": os.environ["UPDATE_NOTES"],
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": {
+                  "darwin-aarch64": {
+                      "signature": os.environ["UPDATE_SIG"].strip(),
+                      "url": os.environ["UPDATE_URL"],
+                  }
+              },
+          }
+          with open("target/release/bundle/macos/latest.json", "w") as f:
+              json.dump(data, f, indent=2)
+          PY
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            target/release/bundle/dmg/*.dmg \
+            target/release/bundle/macos/Prompter.app.tar.gz \
+            target/release/bundle/macos/Prompter.app.tar.gz.sig \
+            target/release/bundle/macos/latest.json \
+            --clobber
