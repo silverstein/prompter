@@ -56,9 +56,9 @@
   /* scroll-behavior:auto -- the JS rAF lerp provides smoothness; CSS smooth
      would fight it. mask fades text in/out at the edges so the eye settles in
      the reading zone (the SOTA voice-teleprompter look). */
-  .tp{flex:1;overflow-y:auto;padding:48px 48px 240px;scroll-behavior:auto;scrollbar-width:none;display:none;
-    -webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 15%,#000 72%,transparent 100%);
-    mask-image:linear-gradient(to bottom,transparent 0,#000 15%,#000 72%,transparent 100%)}
+  .tp{flex:1;min-height:0;overflow-y:auto;padding:48px 48px 0;scroll-behavior:auto;scrollbar-width:none;display:none;
+    -webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 var(--fade,15%),#000 72%,transparent 100%);
+    mask-image:linear-gradient(to bottom,transparent 0,#000 var(--fade,15%),#000 72%,transparent 100%)}
   .tp.show{display:block}
   .tp::-webkit-scrollbar{display:none}
 
@@ -84,6 +84,7 @@
     padding:2px 1px;
     -webkit-box-decoration-break:clone;box-decoration-break:clone
   }
+  .tp .s[data-i]{cursor:pointer}
   .s.up{color:#9ca3af}
   .s.cur{color:#ffffff}
   .s.past{color:#52525b;opacity:.5}
@@ -95,9 +96,20 @@
   .tp[data-hl="off"] .s.past{color:#a1a1aa;opacity:1}
 
   /* Fixed reading line: a faint anchor at ~38% so the eye has a home. */
-  .readline{position:fixed;left:0;right:0;top:32%;height:0;pointer-events:none;
-    z-index:5;border-top:1px solid rgba(34,197,94,0.10);display:none}
-  .readline.show{display:block}
+  /* Room below the last line so it can still scroll up to the reading line.
+     Content, not padding: padding can't shrink, so it pushed the status bar off. */
+  .tp::after{content:'';display:block;height:100vh}
+  /* Room above the first line too, so it can sit on the reading line. */
+  .tp::before{content:'';display:block;height:60vh}
+  /* Cue arrow: marks the reading line from the left margin, never over text. */
+  .readline{position:fixed;width:0;height:0;pointer-events:none;z-index:5;display:none;
+    border-left:10px solid var(--green);border-top:7px solid transparent;border-bottom:7px solid transparent;
+    transform:translateY(-50%);transition:opacity .3s}
+  .readline.show,.readline.dim,.readline.flash{display:block}
+  .readline.dim{opacity:.35}
+  .readline.flash{opacity:1}
+  .setup-hint{line-height:1.7}
+  .cue-mini{color:var(--green)}
 
   .pause{
     display:flex;align-items:center;gap:10px;margin:1.4em 0;padding:14px 18px;
@@ -169,6 +181,9 @@
     padding:2px 10px;border-radius:4px;font-size:11px;cursor:pointer;transition:all .12s
   }
   .status-r button:hover{border-color:var(--text-secondary);color:var(--text-secondary)}
+  .end-btn,.end-sep{display:none}
+  body.in-session .end-btn,body.in-session .end-sep{display:inline-block}
+  .status-r button.end-btn.ready{background:var(--green-dim);border-color:rgba(34,197,94,.5);color:var(--green)}
   .speed-group{display:flex;align-items:center;gap:4px}
   .speed-group input[type=range]{width:64px;accent-color:var(--green);height:3px}
   .speed-val{font-variant-numeric:tabular-nums;min-width:40px;font-size:11px}
@@ -191,14 +206,14 @@
   /* ── Help ── */
   .help{position:fixed;inset:0;background:rgba(0,0,0,.82);display:none;align-items:center;justify-content:center;z-index:60}
   .help.show{display:flex}
-  .help-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:380px;width:90%}
+  .help-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:440px;width:90%;max-height:92vh;overflow-y:auto}
   .help-card h3{margin-bottom:18px;font-size:15px;font-weight:600}
   .help-card table{width:100%;font-size:13px;border-spacing:0}
   .help-card td{padding:5px 0;color:var(--text-secondary)}
-  .help-card .opt{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;font-size:13px;color:var(--text-secondary);padding:5px 0;cursor:pointer}
+  .help-card .opt{display:grid;grid-template-columns:16px 1fr;gap:2px 8px;align-items:baseline;font-size:13px;color:var(--text-secondary);padding:5px 0;cursor:pointer}
   .help-card .opt input{accent-color:var(--green)}
-  .help-card .opt-note{flex-basis:100%;padding-left:22px;font-size:11px;color:var(--text-muted)}
-  .help-card td:first-child{color:var(--text);font-family:ui-monospace,monospace;width:72px;font-size:12px}
+  .help-card .opt-note{grid-column:2;font-size:11px;color:var(--text-muted)}
+  .help-card td:first-child{color:var(--text);font-family:ui-monospace,monospace;width:104px;font-size:12px;white-space:nowrap;padding-right:14px}
 
   /* ── Recent scripts ── */
   .recents{width:100%;max-width:380px;margin-top:8px}
@@ -215,3 +230,16 @@
   .pin{font-size:14px;cursor:pointer;opacity:.4;transition:opacity .15s}
   .pin:hover{opacity:.7}
   .pin.on{opacity:1;color:var(--green)}
+
+/* ── Focus mode: while reading, the title strip and section tabs float over the
+   text (tabs reappear on hover), so the reading line can sit right under the
+   camera. ── */
+body.in-session .titlebar{position:absolute;top:0;left:0;right:0;z-index:20}
+body.in-session .nav{position:absolute;top:var(--title-bar-h);left:0;right:0;z-index:20;
+  background:var(--bg);opacity:0;transition:opacity .2s}
+body.in-session .nav:hover{opacity:1}
+
+/* ── Narrow column, centered (under the camera): less side-to-side eye travel. ── */
+.tp > .sec-head,.tp > .text-block,.tp > .pause,.tp > .branch{
+  max-width:var(--col,460px);margin-left:auto;margin-right:auto}
+

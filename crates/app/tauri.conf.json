@@ -28,6 +28,8 @@
         "center": true,
         "resizable": true,
         "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
         "contentProtected": true
       }
     ],

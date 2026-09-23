@@ -347,6 +347,16 @@ fn set_tracking_position(state: tauri::State<TrackingState>, sentence_index: usi
     }
 }
 
+/// The operator picked a branch answer by hand: the tracker follows from there.
+#[tauri::command]
+fn choose_branch(state: tauri::State<TrackingState>, branch: usize, option: usize) {
+    if let Ok(mut slot) = state.0.lock() {
+        if let Some(s) = slot.as_mut() {
+            s.tracker.choose_branch(branch, option);
+        }
+    }
+}
+
 /// Clear the tracking session (e.g. on reset), so a stale tracker cannot mis-track.
 #[tauri::command]
 fn clear_tracking(state: tauri::State<TrackingState>) {
@@ -474,7 +484,9 @@ fn finish_tracking(
         Some(audio) => {
             let session_dir = session.session_dir.clone();
             std::thread::spawn(move || {
+                let started = Instant::now();
                 let result = verify_with_recording(&mut session, &audio, duration_secs, &section_times, &path);
+                log_verification(duration_secs, started.elapsed().as_secs_f32(), &result);
                 if !load_settings().keep_session_audio {
                     if let Some(d) = session_dir {
                         let _ = fs::remove_dir_all(d);
@@ -506,6 +518,33 @@ fn finish_tracking(
 /// The post-session pass: re-transcribe the whole recording (on-device, biased
 /// toward the script), align it against the script, and rewrite the report
 /// with recording-verified coverage, speaking pace, and off-script words.
+/// Append one line per verification pass to `~/.prompter/verification.log`
+/// (outcome and timing only, never transcript text), so a failure the user
+/// dismissed can still be diagnosed.
+fn log_verification(duration_secs: u64, took_secs: f32, result: &Result<prompter_core::ComplianceReport, String>) {
+    use std::io::Write;
+    let Some(home) = dirs_next::home_dir() else { return };
+    let path = home.join(".prompter").join("verification.log");
+    let outcome = match result {
+        Ok(_) => "ok".to_string(),
+        Err(e) => format!("failed: {e}"),
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(path) {
+        let _ = writeln!(f, "{stamp} session={duration_secs}s check={took_secs:.1}s {outcome}");
+    }
+}
+
 fn verify_with_recording(
     session: &mut TrackingSession,
     audio: &std::path::Path,
@@ -536,6 +575,13 @@ fn verify_with_recording(
         })?;
     let text = parsed["file_text"].as_str().unwrap_or_default().to_string();
     let words = parsed["words"].as_u64().unwrap_or(0) as f32;
+    let errors: Vec<&str> = parsed["errors"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|e| e.as_str()).collect())
+        .unwrap_or_default();
+    if words == 0.0 && !errors.is_empty() {
+        return Err(format!("speech recognizer: {}", errors.join("; ")));
+    }
     let speaking_secs = parsed["speaking_secs"].as_f64().unwrap_or(0.0) as f32;
 
     let realigned = realign(session.recorder.sentences(), &text);
@@ -893,6 +939,22 @@ struct Settings {
     /// & System Audio Recording permission).
     #[serde(default)]
     detect_other_party: bool,
+    /// Where the line being read sits, as a fraction of the prompter height.
+    /// Near the top keeps the reader's eyes close to the camera.
+    #[serde(default = "default_eye_line")]
+    eye_line: f32,
+    /// Width of the text column in px. Narrow keeps eye movement small, so the
+    /// reader doesn't visibly scan side to side on camera.
+    #[serde(default = "default_col_width")]
+    col_width: u32,
+}
+
+fn default_eye_line() -> f32 {
+    0.10
+}
+
+fn default_col_width() -> u32 {
+    460
 }
 
 fn default_true() -> bool {
@@ -1176,6 +1238,31 @@ fn urlencoding_decode(s: &str) -> String {
 }
 
 /// Label for the screen-share toggle, with a check when protection is on.
+/// The tray's screen-share menu item, kept so the in-app toggle can update its
+/// label too.
+#[derive(Default)]
+struct ScreenShareItem(Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>);
+
+/// Hide (or show) the prompter in screenshots, screen shares and recordings,
+/// persist the choice, and keep the tray item and the UI in sync.
+fn apply_screen_share(app: &tauri::AppHandle, hidden: bool) {
+    for (_, win) in app.webview_windows() {
+        let _ = win.set_content_protected(hidden);
+    }
+    if let Some(item) = app.state::<ScreenShareItem>().0.lock().ok().and_then(|g| g.clone()) {
+        let _ = item.set_text(screen_share_label(hidden));
+    }
+    let mut s = load_settings();
+    s.hide_from_screen_share = Some(hidden);
+    let _ = save_settings(s);
+    let _ = app.emit("screen-share-changed", hidden);
+}
+
+#[tauri::command]
+fn set_hide_from_screen_share(app: tauri::AppHandle, hidden: bool) {
+    apply_screen_share(&app, hidden);
+}
+
 fn screen_share_label(hidden: bool) -> &'static str {
     if hidden {
         "Hide from Screen Share ✓"
@@ -1189,6 +1276,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_deep_link::init())
         .manage(TrackingState::default())
+        .manage(ScreenShareItem::default())
         .setup(|app| {
             use tauri::Listener;
 
@@ -1198,8 +1286,6 @@ fn main() {
             // and persists the choice. Mirrors the minutes "Hide from Screen
             // Share" tray item.
             {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                use std::sync::Arc;
                 use tauri::menu::{Menu, MenuItem};
                 use tauri::tray::TrayIconBuilder;
 
@@ -1222,23 +1308,16 @@ fn main() {
                     MenuItem::with_id(app, "tray_quit", "Quit Prompter", true, None::<&str>)?;
                 let menu = Menu::with_items(app, &[&screen_item, &quit])?;
 
-                let state = Arc::new(AtomicBool::new(hidden));
-                let state_cl = state.clone();
-                let item_cl = screen_item.clone();
+                if let Ok(mut slot) = app.state::<ScreenShareItem>().0.lock() {
+                    *slot = Some(screen_item.clone());
+                }
 
                 let mut tray = TrayIconBuilder::with_id("prompter-tray")
                     .menu(&menu)
                     .on_menu_event(move |app, event| match event.id().as_ref() {
                         "screen-share-toggle" => {
-                            let new_state = !state_cl.load(Ordering::Relaxed);
-                            state_cl.store(new_state, Ordering::Relaxed);
-                            let _ = item_cl.set_text(screen_share_label(new_state));
-                            for (_, win) in app.webview_windows() {
-                                let _ = win.set_content_protected(new_state);
-                            }
-                            let mut s = load_settings();
-                            s.hide_from_screen_share = Some(new_state);
-                            let _ = save_settings(s);
+                            let hidden = load_settings().hide_from_screen_share.unwrap_or(true);
+                            apply_screen_share(app, !hidden);
                         }
                         "tray_quit" => app.exit(0),
                         _ => {}
@@ -1284,6 +1363,7 @@ fn main() {
             clear_tracking,
             finish_tracking,
             set_tracking_position,
+            choose_branch,
             start_speech,
             stop_speech,
             save_compliance,
@@ -1292,6 +1372,7 @@ fn main() {
             save_settings,
             add_recent_script,
             set_always_on_top,
+            set_hide_from_screen_share,
             list_available_scripts
         ])
         .run(tauri::generate_context!())

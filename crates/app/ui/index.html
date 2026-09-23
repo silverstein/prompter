@@ -8,7 +8,7 @@
 <style>/* empty */</style>
 </head>
 <body>
-<div class="titlebar"></div>
+<div class="titlebar" data-tauri-drag-region></div>
 <div class="error-bar" id="err"></div>
 <div class="nav" id="nav"></div>
 
@@ -29,7 +29,7 @@
 
 <div class="start-bar" id="startBar">
   <button class="btn-primary" id="btnStart">Start Session</button>
-  <span class="hint">or press <kbd>Space</kbd></span>
+  <span class="hint setup-hint"><span class="cue-mini">&#9656;</span> is your reading line &mdash; put it just under your camera<br><kbd>[</kbd> <kbd>]</kbd> move &middot; <kbd>,</kbd> <kbd>.</kbd> width &middot; <kbd>+</kbd> <kbd>&minus;</kbd> size &middot; <kbd>Space</kbd> start &middot; <kbd>H</kbd> shortcuts</span>
   <div style="flex:1"></div>
   <div class="audio-viz mic-test" id="micTest" title="Mic test — speak to see bars move">
     <div class="bar"></div><div class="bar"></div><div class="bar"></div>
@@ -67,6 +67,8 @@
     <span class="font-val" id="fontVal">34</span>
     <button id="btnFontUp">A+</button>
     <div class="sep"></div>
+    <button id="btnEnd" class="end-btn" title="End the session and see the report (Esc)">End</button>
+    <div class="sep end-sep"></div>
     <button id="btnHelp">?</button>
     <div class="sep"></div>
     <span class="pin" id="pinBtn" title="Always on top">&#x1F4CC;</span>
@@ -77,20 +79,28 @@
 
 <div class="help" id="helpOverlay">
   <div class="help-card" id="helpCard">
-    <h3>Keyboard Shortcuts</h3>
+    <h3>Reading position</h3>
+    <table>
+      <tr><td>[ / ]</td><td>Move the reading line up / down (keep it just under your camera)</td></tr>
+      <tr><td>, / .</td><td>Narrower / wider text column</td></tr>
+      <tr><td>+ / &ndash;</td><td>Font size</td></tr>
+    </table>
+    <h3 style="margin-top:18px">Moving around</h3>
+    <table>
+      <tr><td>&#x2191; &#x2193;</td><td>Previous / Next sentence</td></tr>
+      <tr><td>Click a line</td><td>Make it the current line</td></tr>
+      <tr><td>1 &ndash; 9</td><td>Jump to section</td></tr>
+      <tr><td>Tab / Enter</td><td>Choose a branch answer by hand</td></tr>
+    </table>
+    <h3 style="margin-top:18px">Session</h3>
     <table>
       <tr><td>Space</td><td>Start / Pause / Resume</td></tr>
-      <tr><td>&#x2191; &#x2193;</td><td>Previous / Next sentence</td></tr>
-      <tr><td>1 &ndash; 9</td><td>Jump to section</td></tr>
-      <tr><td>Tab</td><td>Cycle branch options</td></tr>
-      <tr><td>Enter</td><td>Select branch option</td></tr>
-      <tr><td>+ / &ndash;</td><td>Font size</td></tr>
-      <tr><td>&#8984;O</td><td>Open file</td></tr>
-      <tr><td>&#8984;V</td><td>Paste script</td></tr>
+      <tr><td>Esc</td><td>End session (or click End)</td></tr>
+      <tr><td>&#8984;O / &#8984;V</td><td>Open file / Paste script</td></tr>
       <tr><td>H</td><td>This help</td></tr>
-      <tr><td>Esc</td><td>End session</td></tr>
     </table>
     <h3 style="margin-top:22px">Session options</h3>
+    <label class="opt"><input type="checkbox" id="optHidden"> Hide Prompter from screenshots, recordings and screen sharing (Zoom, Meet) <span class="opt-note">On by default; also in the menu-bar icon</span></label>
     <label class="opt"><input type="checkbox" id="optVerify"> Double-check coverage against the full recording after each session <span class="opt-note">Audio is deleted once checked</span></label>
     <label class="opt"><input type="checkbox" id="optKeepAudio"> Keep session audio <span class="opt-note">Off by default: consult audio is patient data</span></label>
     <label class="opt"><input type="checkbox" id="optOther"> Detect when the patient is talking on a call <span class="opt-note">Uses call audio; needs Screen &amp; System Audio Recording permission</span></label>
@@ -146,7 +156,7 @@ function initRefs(){
   ['err','nav','empty','tp','startBar','status','dot','audioViz','stLabel','stCurText',
    'progFill','stWords','stTime','speedVal','speedSlider','fontVal',
    'doneOverlay','doneCard','helpOverlay','helpCard','recentsContainer','pinBtn',
-   'btnOpen','btnPaste','btnStart','btnClose','btnFontDown','btnFontUp','btnHelp'
+   'btnOpen','btnPaste','btnStart','btnClose','btnFontDown','btnFontUp','btnHelp','btnEnd'
   ].forEach(id=>{els[id]=$(id)});
 }
 
@@ -160,6 +170,9 @@ document.addEventListener('DOMContentLoaded', ()=>{
   els.btnFontDown.addEventListener('click', ()=>setFont(-2));
   els.btnFontUp.addEventListener('click', ()=>setFont(2));
   els.btnHelp.addEventListener('click', toggleHelp);
+  els.btnEnd.addEventListener('click', ()=>{
+    if(state==='run'||state==='pause'||state==='wait') endSession();
+  });
   els.helpOverlay.addEventListener('click', toggleHelp);
   els.helpCard.addEventListener('click', e=>e.stopPropagation());
   els.speedSlider.addEventListener('input', e=>{
@@ -169,6 +182,13 @@ document.addEventListener('DOMContentLoaded', ()=>{
     persistSettings();
   });
   els.pinBtn.addEventListener('click', togglePin);
+  els.tp.addEventListener('wheel', holdFollow, {passive:true});
+  els.tp.addEventListener('touchmove', holdFollow, {passive:true});
+  els.tp.addEventListener('click', e=>{
+    if(state!=='run'&&state!=='pause'&&state!=='wait') return;
+    const line=e.target.closest('.s[data-i],.pause[data-i]');
+    if(line) jumpTo(+line.dataset.i);
+  });
   // Drag-and-drop on the whole window
   document.addEventListener('dragover', e=>{e.preventDefault();e.stopPropagation()});
   document.addEventListener('drop', handleDrop);
@@ -250,6 +270,9 @@ function loadScript(data){
   buildNav(); buildTP();
   highlight();
   show('nav'); show('startBar'); show('tp');
+  // Snap the first line onto the reading line, then keep it there (the follow
+  // loop also absorbs late layout changes: saved font size, width, resizes).
+  requestAnimationFrame(()=>{ snapToCurrent(); placeReadline(); updateGuide(); startFollow(); });
   hide('empty'); hide('status'); hide('doneOverlay');
 
   // Web Speech API handles mic access when session starts
@@ -314,14 +337,14 @@ async function startSession(){
   }
 
   startFollow();                                   // eased scroll follows the cursor
-  document.getElementById('readline').classList.add('show');
+  placeReadline(); updateGuide();
   updateSt(); startClock();
 }
 function resetAll(){
   stopScroll(); stopClock(); stopAppleSpeech(); stopFollow();
-  document.getElementById('readline').classList.remove('show');
   invoke('clear_tracking').catch(()=>{});
-  script=null; items=[]; idx=0; mainSentenceItemIdx=[]; state='idle';
+  script=null; items=[]; idx=0; mainSentenceItemIdx=[]; state='idle'; branchCur=null;
+  updateGuide();
   hide('nav'); hide('tp'); hide('startBar'); hide('status'); hide('doneOverlay');
   show('empty');
 }
@@ -389,11 +412,15 @@ async function startAppleSpeech(){
     trackUnlisten = await listen('track-update', (event)=>{
       const u = event.payload;
       if(state!=='run') return;
+      // Reading a branch answer: highlight and hold that line on the reading line.
+      if(u.state === 'in_branch'){ followBranch(u); return; }
       const itemIdx = mainSentenceItemIdx[u.sentence_index];
       if(itemIdx === undefined) return;
+      if(branchCur && (itemIdx > idx || u.relocated)) leaveBranch();
       // Forward-only, except when the tracker's whole-script relocator has
       // confirmed a real skip or a jump back to re-read.
       if(itemIdx > idx || (u.relocated && itemIdx !== idx)){
+        if(u.relocated) resumeFollow();
         idx = itemIdx;
         trackSection();
         highlight();
@@ -456,7 +483,7 @@ function toggle(){
 // ── End session ──
 function endSession(){
   state='done'; stopScroll(); stopClock(); stopAppleSpeech(); stopFollow();
-  document.getElementById('readline').classList.remove('show'); updateSt();
+  updateSt();
   const elapsed = t0 ? Math.floor((Date.now()-t0)/1000) : 0;
   const card = els.doneCard;
   while(card.firstChild) card.removeChild(card.firstChild);
@@ -608,19 +635,28 @@ function endSession(){
 // Manual navigation re-anchors the voice tracker, so speech is matched from
 // where the speaker says they are (the "I'm here" override).
 function syncTracker(){
+  leaveBranch();
+  // A pause/branch cue belongs to where the tracker was; the reader just moved.
+  if(liveCue){ liveCue = null; turnEnded = false; updateSt(); }
   if(!audioMode) return;
   let s = -1;
   for(let k=0;k<mainSentenceItemIdx.length;k++){ if(mainSentenceItemIdx[k] <= idx) s = k; else break; }
   if(s >= 0) invoke('set_tracking_position', {sentenceIndex: s}).catch(()=>{});
 }
 function advance(){
-  if(idx<items.length-1){idx++;trackSection();highlight();syncTracker()}
+  if(idx<items.length-1){idx++;trackSection();highlight();syncTracker();resumeFollow()}
   else if(state==='run') endSession();
 }
-function retreat(){if(idx>0){idx--;highlight();syncTracker()}}
+function retreat(){if(idx>0){idx--;highlight();syncTracker();resumeFollow()}}
+// Click a line during a session to make it the current one ("I'm here").
+function jumpTo(i){
+  if(i<0||i>=items.length) return;
+  idx=i; trackSection(); highlight(); syncTracker(); resumeFollow();
+}
 function jumpSec(si){
   const i=items.findIndex(it=>it.section===si);
   if(i>=0){
+    resumeFollow();
     idx=i;
     syncTracker();
     if(!secTimes[si]) secTimes[si]=Date.now();
@@ -647,10 +683,14 @@ function buildTP(){
   const tp=els.tp;
   while(tp.firstChild) tp.removeChild(tp.firstChild);
   let sentenceIndex=0;
+  // Timeline index of every rendered step, in the same order the Rust
+  // ScriptTracker flattens the script (section, sentence, pause, branch, each
+  // option's sentences), so a track-update's timeline_index finds its element.
+  let t=0, bi=0; branchCur=null;
 
   script.sections.forEach((sec,si)=>{
     const hd=document.createElement('div');
-    hd.className='sec-head'; hd.id='sec-'+si;
+    hd.className='sec-head'; hd.id='sec-'+si; hd.dataset.t=t++;
     const num=document.createElement('span'); num.className='num'; num.textContent=si+1;
     const label=document.createElement('span'); label.textContent=sec.name;
     hd.appendChild(num); hd.appendChild(label);
@@ -661,7 +701,7 @@ function buildTP(){
         const blk=document.createElement('div'); blk.className='text-block';
         el.sentences.forEach(s=>{
           const sp=document.createElement('span');
-          sp.className='s'; sp.dataset.i=sentenceIndex;
+          sp.className='s'; sp.dataset.i=sentenceIndex; sp.dataset.t=t++;
           sp.textContent=s.text+' ';
           blk.appendChild(sp);
           sentenceIndex++;
@@ -669,14 +709,15 @@ function buildTP(){
         tp.appendChild(blk);
       } else if(el.type==='pause'){
         const m=document.createElement('div');
-        m.className='pause'; m.dataset.i=sentenceIndex;
+        m.className='pause'; m.dataset.i=sentenceIndex; m.dataset.t=t++;
         const ic=document.createElement('span'); ic.textContent='\u23F8';
         const tx=document.createElement('span'); tx.textContent=el.prompt;
         m.appendChild(ic); m.appendChild(tx);
         tp.appendChild(m);
         sentenceIndex++;
       } else if(el.type==='branch'){
-        const c=document.createElement('div'); c.className='branch';
+        const c=document.createElement('div'); c.className='branch'; c.dataset.t=t++;
+        const branchIdx=bi++; // the tracker numbers branches in the same order
         const q=document.createElement('div'); q.className='branch-q'; q.textContent=el.question;
         c.appendChild(q);
         const opts=document.createElement('div'); opts.className='branch-opts';
@@ -691,6 +732,12 @@ function buildTP(){
             if(target) target.classList.add('show');
             // Track branch decision for compliance
             branchDecisions[el.question] = opt.label;
+            // Voice mode: tell the tracker, and follow from the answer's start.
+            if(audioMode && state!=='idle' && state!=='loaded' && state!=='done'){
+              invoke('choose_branch', {branch: branchIdx, option: oi}).catch(()=>{});
+              const first=target && target.querySelector('.s[data-t]');
+              if(first) followBranch({timeline_index: +first.dataset.t, option_label: opt.label});
+            }
           });
           opts.appendChild(btn);
         });
@@ -700,7 +747,7 @@ function buildTP(){
           body.className='branch-body'; body.dataset.bo=si+'-'+oi;
           opt.sentences.forEach(s=>{
             const sp=document.createElement('span');
-            sp.className='s up'; sp.textContent=s.text+' ';
+            sp.className='s up'; sp.dataset.t=t++; sp.textContent=s.text+' ';
             body.appendChild(sp);
           });
           c.appendChild(body);
@@ -719,7 +766,7 @@ function highlight(){
     const i=+el.dataset.i;
     el.classList.remove('past','cur','up');
     if(i<idx) el.classList.add('past');
-    else if(i===idx) el.classList.add('cur');
+    else if(i===idx) el.classList.add(branchCur ? 'past' : 'cur');
     else el.classList.add('up');
   });
 
@@ -731,7 +778,38 @@ function highlight(){
   // Show current sentence text in status bar for feedback
   if(els.stCurText && items[idx]) els.stCurText.textContent = items[idx].text.substring(0,50);
 
-  updateNav(); updateProgress();
+  updateNav(); updateProgress(); updateEnd();
+}
+
+// ── Branch answers (voice mode) ──
+// The tracker picks the answer the speaker starts reading and follows them
+// through it. Show that answer, mark its lines, and let the follow scroll hold
+// the current one on the reading line.
+let branchCur = null;
+function followBranch(u){
+  const el = els.tp.querySelector('.branch-body [data-t="'+u.timeline_index+'"]');
+  if(!el) return;
+  const body = el.closest('.branch-body'), c = el.closest('.branch');
+  if(!body.classList.contains('show')){
+    c.querySelectorAll('.branch-body').forEach(b=>b.classList.toggle('show', b===body));
+    const oi = +body.dataset.bo.split('-')[1];
+    c.querySelectorAll('.branch-opt').forEach((b,i)=>b.classList.toggle('sel', i===oi));
+    branchDecisions[c.querySelector('.branch-q').textContent] = u.option_label;
+  }
+  let seen = false;
+  body.querySelectorAll('.s').forEach(s=>{
+    s.classList.remove('past','cur','up');
+    if(s===el){ s.classList.add('cur'); seen=true; } else s.classList.add(seen?'up':'past');
+  });
+  branchCur = el;
+  highlight();
+}
+function leaveBranch(){
+  if(!branchCur) return;
+  branchCur.closest('.branch-body').querySelectorAll('.s').forEach(s=>{
+    s.classList.remove('cur','up'); s.classList.add('past');
+  });
+  branchCur = null;
 }
 
 // ── Eased follow scroll ──
@@ -739,14 +817,71 @@ function highlight(){
 // top. Because it eases toward a moving target every frame, it never jumps -- a
 // big cursor correction just glides faster, and a frozen cursor just holds.
 let scrollRAF = null;
+// Manual scroll: while the reader scrolls (wheel / trackpad / touch) the follow
+// loop stands down for a few seconds instead of pulling the view straight back.
+// It resumes after the hold, or at once on any cursor move they asked for (click
+// a line, arrows, section jump) or a tracker relocation (they started reading
+// somewhere else).
+const MANUAL_HOLD_MS = 5000;
+let manualUntil = 0;
+function holdFollow(){ manualUntil = Date.now() + MANUAL_HOLD_MS; }
+function resumeFollow(){ manualUntil = 0; }
+// The reading line ("eye line"): where the current line is held, as a fraction
+// of the prompter height. Near the top keeps the reader's eyes by the camera, so
+// they look at the viewer rather than down at the screen. [ and ] move it.
+let eyeLine = 0.10;
+// Text column width (px); , and . narrow / widen it.
+let colWidth = 460;
+function applyCol(){ els.tp.style.setProperty('--col', colWidth+'px'); }
+function moveCol(d){
+  colWidth = Math.min(1200, Math.max(280, colWidth + d));
+  applyCol(); persistSettings();
+}
+function eyeY(){ const tp=els.tp; return tp.getBoundingClientRect().top + tp.clientHeight*eyeLine; }
+// The cue arrow sits in the left margin of the text column, pointing at the
+// middle of the line held on the reading line.
+function placeReadline(){
+  const g=$('readline'), col=els.tp.querySelector('.text-block');
+  const cur=document.querySelector('[data-i="'+idx+'"]');
+  const half=(cur && cur.getClientRects()[0]) ? cur.getClientRects()[0].height/2 : 18;
+  g.style.top = (eyeY()+half)+'px';
+  if(col) g.style.left = (col.getBoundingClientRect().left - 22)+'px';
+  // The top fade ends just above the reading line, so the line being read is
+  // never faded however high it's set.
+  els.tp.style.setProperty('--fade', Math.max(2, eyeLine*100 - 6)+'%');
+}
+function moveEyeLine(d){
+  eyeLine = Math.min(0.6, Math.max(0.06, Math.round((eyeLine+d)*100)/100));
+  placeReadline(); flashGuide(); persistSettings();
+  if(state==='loaded') snapToCurrent();
+}
+window.addEventListener('resize', ()=>{ placeReadline(); if(state==='loaded') snapToCurrent(); });
+// Jump (no easing) so the current line sits on the reading line -- used before
+// a session starts, where the follow loop isn't running.
+function snapToCurrent(){
+  const cur = document.querySelector('[data-i="'+idx+'"]');
+  if(cur) els.tp.scrollTop += cur.getBoundingClientRect().top - eyeY();
+}
+// The guide line is a setup aid: shown before a session starts (with the hint)
+// and briefly while adjusting mid-read, never across the text while reading.
+let guideTimer = null;
+function flashGuide(){
+  const g = $('readline'); g.classList.add('flash');
+  clearTimeout(guideTimer); guideTimer = setTimeout(()=>g.classList.remove('flash'), 1500);
+}
+function updateGuide(){
+  const g=$('readline');
+  g.classList.toggle('show', state==='loaded');
+  g.classList.toggle('dim', state==='run'||state==='pause'||state==='wait');
+}
 function scrollFollow(){
   if(state==='idle'||state==='done'){ scrollRAF=null; return; }
-  const cur=document.querySelector('[data-i="'+idx+'"]');
-  if(cur){
+  placeReadline();
+  const cur=branchCur || document.querySelector('[data-i="'+idx+'"]');
+  if(cur && Date.now() >= manualUntil){
     const tp=els.tp;
-    const tpRect=tp.getBoundingClientRect();
     const curRect=cur.getBoundingClientRect();
-    const targetY=tpRect.top + tpRect.height*0.32;
+    const targetY=eyeY();
     const delta=curRect.top - targetY;          // current line vs the read-line
     if(Math.abs(delta) > 0.5){
       tp.scrollTop += delta * 0.14;             // ease ~14% of the gap per frame
@@ -790,6 +925,21 @@ function updateSt(){
     case 'done': d.classList.add('fin'); l.textContent='Complete'; break;
     default: l.textContent='Ready';
   }
+  updateEnd(); updateGuide();
+}
+
+// End button: shown only during a session. In voice mode reaching the last line
+// doesn't end the session (the conversation often goes on past the script's
+// close), so the button turns into a highlighted "Finish" there instead.
+function updateEnd(){
+  const live = state==='run'||state==='pause'||state==='wait';
+  if(document.body.classList.contains('in-session') !== live){
+    document.body.classList.toggle('in-session', live);
+    placeReadline(); // focus mode changes where the prompter starts
+  }
+  const atEnd = live && items.length && idx>=items.length-1;
+  els.btnEnd.classList.toggle('ready', !!atEnd);
+  els.btnEnd.textContent = atEnd ? 'Finish' : 'End';
 }
 
 // ── Clock ──
@@ -808,6 +958,7 @@ function setFont(d){
   document.documentElement.style.setProperty('--font-size',fontSize+'px');
   els.fontVal.textContent=fontSize;
   persistSettings();
+  if(state==='loaded') requestAnimationFrame(snapToCurrent);
 }
 
 // ── Help ──
@@ -841,6 +992,9 @@ async function restoreSettings(){
       speed=s.speed; els.speedSlider.value=speed; els.speedVal.textContent=speed+' wpm';
     }
     if(s.always_on_top){ pinned=true; els.pinBtn.classList.add('on'); }
+    if(typeof s.eye_line === 'number') eyeLine = s.eye_line;
+    if(typeof s.col_width === 'number') colWidth = s.col_width;
+    applyCol();
     hlMode = s.highlight_mode || 'soft';
     if(els.tp) els.tp.dataset.hl = hlMode;
   }catch(e){}
@@ -854,6 +1008,8 @@ async function persistSettings(){
     current.speed = speed;
     current.always_on_top = pinned;
     current.highlight_mode = hlMode;
+    current.eye_line = eyeLine;
+    current.col_width = colWidth;
     await invoke('save_settings', { settings: current });
   }catch(e){}
 }
@@ -938,6 +1094,18 @@ async function bindSessionOptions(){
 }
 bindSessionOptions();
 
+// Screen-share hiding goes through Rust (it changes the window, and keeps the
+// menu-bar item in sync); unset means hidden.
+(async function bindScreenShare(){
+  const el = document.getElementById('optHidden');
+  if(!el) return;
+  try{ const st = await invoke('load_settings'); el.checked = st.hide_from_screen_share ?? true; }catch(e){ el.checked = true; }
+  el.addEventListener('change', ()=>{
+    invoke('set_hide_from_screen_share', {hidden: el.checked}).catch(e=>showErr('Couldn\u2019t change screen-share hiding: '+e));
+  });
+  listen('screen-share-changed', e=>{ el.checked = !!e.payload; });
+})();
+
 // ── Keyboard ──
 document.addEventListener('keydown', e=>{
   if((e.metaKey||e.ctrlKey)&&e.key==='v'&&!script){e.preventDefault();pasteScript();return}
@@ -960,6 +1128,10 @@ document.addEventListener('keydown', e=>{
     case '+':case '=':setFont(2);break;
     case '-':case '_':setFont(-2);break;
     case 'h':case 'H':toggleHelp();break;
+    case ',':moveCol(-40);flashGuide();break;
+    case '.':moveCol(40);flashGuide();break;
+    case '[':moveEyeLine(-0.03);break;
+    case ']':moveEyeLine(0.03);break;
     case 'm':case 'M':cycleHl();break;
     case 'Tab':
       e.preventDefault();

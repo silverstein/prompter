@@ -182,11 +182,17 @@ func transcribeFile(_ path: String) -> Never {
         fail("file_unreadable")
         exit(1)
     }
+    // The recognizer calls back on the main queue by default, and this function
+    // blocks the main thread on a semaphore per chunk: deliver results on a
+    // background queue or every chunk deadlocks until its timeout and comes
+    // back empty.
+    recognizer.queue = OperationQueue()
     let format = file.processingFormat
     let chunkFrames = AVAudioFrameCount(format.sampleRate * 50)
     var pieces: [String] = []
     var spans: [(Double, Double)] = [] // absolute word start/end seconds
     var chunkStart = 0.0
+    var chunkErrors: [String] = [] // recognizer errors, reported so failures aren't silent
     while file.framePosition < file.length {
         let request = SFSpeechAudioBufferRecognitionRequest()
         configure(request)
@@ -207,11 +213,15 @@ func transcribeFile(_ path: String) -> Never {
             if let r = result {
                 best = r.bestTranscription
                 if r.isFinal { sem.signal() }
-            } else if error != nil {
+            } else if let e = error {
+                chunkErrors.append(e.localizedDescription)
                 sem.signal()
             }
         }
-        if sem.wait(timeout: .now() + 180) == .timedOut { task.cancel() }
+        if sem.wait(timeout: .now() + 180) == .timedOut {
+            task.cancel()
+            chunkErrors.append("chunk timed out")
+        }
         if let t = best {
             pieces.append(t.formattedString)
             for seg in t.segments {
@@ -233,7 +243,8 @@ func transcribeFile(_ path: String) -> Never {
         }
     }
     if let p = phrase { speaking += p.1 - p.0 }
-    emit(["file_text": pieces.joined(separator: " "), "words": spans.count, "speaking_secs": speaking])
+    emit(["file_text": pieces.joined(separator: " "), "words": spans.count, "speaking_secs": speaking,
+          "errors": Array(Set(chunkErrors))])
     exit(0)
 }
 
