@@ -20,6 +20,11 @@ cd ../..
 echo "=== Embedding speech recognizer in app bundle ==="
 cp target/speech-recognizer target/release/bundle/macos/Prompter.app/Contents/MacOS/speech-recognizer
 echo "  Embedded speech-recognizer in app bundle"
+# Adding a file after Tauri signed the bundle invalidates its signature (and
+# Gatekeeper then calls a downloaded copy "damaged"): re-sign ad hoc.
+codesign --force --deep --sign - target/release/bundle/macos/Prompter.app
+codesign --verify --deep --strict target/release/bundle/macos/Prompter.app
+echo "  Re-signed app bundle (ad hoc)"
 
 echo "=== Build complete ==="
 echo "  App: target/release/bundle/macos/Prompter.app"
