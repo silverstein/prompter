@@ -1275,7 +1275,46 @@ fn screen_share_label(hidden: bool) -> &'static str {
     }
 }
 
+/// Diagnostic mode: `Prompter --transcribe-file <audio> --script <md> --out <json>`
+/// runs the speech helper's file mode (the post-session check) and writes its
+/// output, without opening a window. It has to go through the app because
+/// macOS grants speech recognition to Prompter.app, not to a shell; launch it
+/// with `open -n -W -a Prompter --args ...`. Lets the check be reproduced on
+/// a kept recording or synthetic audio.
+fn transcribe_file_mode() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    let arg = |flag: &str| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let audio = arg("--transcribe-file")?;
+    let out = arg("--out")?;
+    let mut cmd = std::process::Command::new(speech_helper_path());
+    cmd.arg("--file").arg(&audio);
+    if let Some(script) = arg("--script") {
+        cmd.arg("--script").arg(script);
+    }
+    let code = match cmd.output() {
+        Ok(o) => {
+            let mut body = o.stdout;
+            body.extend_from_slice(&o.stderr);
+            let _ = fs::write(&out, body);
+            o.status.code().unwrap_or(1)
+        }
+        Err(e) => {
+            let _ = fs::write(&out, format!("{{\"error\":\"could not run helper: {e}\"}}\n"));
+            1
+        }
+    };
+    Some(code)
+}
+
 fn main() {
+    if let Some(code) = transcribe_file_mode() {
+        std::process::exit(code);
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_deep_link::init())

@@ -403,3 +403,40 @@ fn real_read_skipping_into_an_answer_is_followed() {
     // Timeline of the YES answer's second sentence in this script.
     assert_eq!(last_in_answer, Some(20), "followed to the answer's second sentence");
 }
+
+/// The post-session check on a 99 s recording of the lighthouse script (spoken
+/// by macOS text-to-speech, with 4-5 s pauses between paragraphs). Before the
+/// helper split recordings at silences, Apple's per-chunk final result kept
+/// only the text after each chunk's last pause: 36 words, 2 sentences. With
+/// the split, every sentence that was spoken counts as delivered, and the
+/// three the recording left out are exactly the ones reported missing.
+#[test]
+fn file_transcript_of_a_full_read_covers_every_sentence() {
+    use prompter_core::{realign, ScriptTracker, TimelineStep};
+    let rec = include_str!("fixtures/lighthouse-reread.recording.jsonl");
+    let header: serde_json::Value = serde_json::from_str(rec.lines().next().unwrap()).unwrap();
+    let parsed = script::parse(header["source"].as_str().unwrap()).unwrap();
+    let main: Vec<String> = ScriptTracker::new(&parsed)
+        .timeline()
+        .iter()
+        .filter_map(|s| match s {
+            TimelineStep::Sentence { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let full = include_str!("fixtures/lighthouse-tts.file-transcript.txt");
+    let r = realign(&main, full);
+    let missed: Vec<String> = main
+        .iter()
+        .zip(&r.covered)
+        .filter(|(_, c)| !**c)
+        .map(|(s, _)| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+        .collect();
+    assert_eq!(missed, ["The keeper kept", "When he retired,", "If the highlight"]);
+
+    // What the chunked check produced from the same audio.
+    let broken = "On the fourth night the main lamp went dark he climbed the spiral stairs with a lantern in one hand and a box of spare wicks in the other Thank you for listening to this short test";
+    let r = realign(&main, broken);
+    assert!(r.covered.iter().filter(|c| **c).count() <= 3);
+}

@@ -8,7 +8,7 @@
 //   {"other": true} / {"other": false, "secs": 4.2}   (with --system-audio)
 //
 // FILE mode (--file <audio>): transcribes a finished recording and prints one
-//   {"file_text": "...", "words": 2412, "speaking_secs": 1040.5}
+//   {"file_text": "...", "words": 2412, "speaking_secs": 1040.5, "pieces": 61, "errors": []}
 // then exits.
 //
 // Options:
@@ -174,8 +174,84 @@ func configure(_ request: SFSpeechRecognitionRequest) {
 
 // ── FILE mode: transcribe a finished recording ──
 
-/// Transcribe in ~50 s chunks (each its own request) so a long consult never
-/// hits a per-request limit; word timings give the time actually spent talking.
+/// Split points for file transcription. Apple's recognizer starts its
+/// transcript over after a pause, and a request's final result then holds only
+/// the text after the last pause, so a long chunk loses almost everything said
+/// before it. Cut the recording at silences instead: each piece holds speech
+/// with no long pause inside, and silent stretches aren't sent at all.
+/// Returns (startFrame, endFrame) pieces of at most `maxSecs`.
+func speechPieces(_ file: AVAudioFile, maxSecs: Double = 30) -> [(AVAudioFramePosition, AVAudioFramePosition)] {
+    let format = file.processingFormat
+    let rate = format.sampleRate
+    let hop = AVAudioFrameCount(rate / 10) // 100 ms frames
+    // Pass 1: loudness (dBFS) of every 100 ms frame.
+    var db: [Float] = []
+    file.framePosition = 0
+    while file.framePosition < file.length {
+        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: hop) else { break }
+        do { try file.read(into: buf, frameCount: hop) } catch { break }
+        let n = Int(buf.frameLength)
+        if n == 0 { break }
+        var sum: Float = 0
+        if let ch = buf.floatChannelData?[0] {
+            for i in 0..<n { sum += ch[i] * ch[i] }
+        }
+        db.append(10 * log10(max(sum / Float(n), 1e-10)))
+    }
+    file.framePosition = 0
+    if db.isEmpty { return [] }
+    // Silence: within 12 dB of the noise floor (10th percentile), never louder
+    // than -35 dBFS.
+    let floor = db.sorted()[db.count / 10]
+    let threshold = min(floor + 12, -35)
+    let quiet = db.map { $0 < threshold }
+    let minGap = 6 // frames of silence (0.6 s) that count as a pause to cut at
+    let maxFrames = Int(maxSecs * 10)
+
+    var pieces: [(Int, Int)] = []
+    var i = 0
+    while i < db.count {
+        while i < db.count && quiet[i] { i += 1 } // skip leading silence
+        if i >= db.count { break }
+        let start = i
+        var end = min(start + maxFrames, db.count)
+        // Prefer ending at the first pause of at least `minGap` frames.
+        var run = 0
+        var cut: Int? = nil
+        var j = start
+        while j < end {
+            run = quiet[j] ? run + 1 : 0
+            if run >= minGap { cut = j - run + 1; break }
+            j += 1
+        }
+        if let c = cut {
+            end = c
+        } else if end < db.count {
+            // No pause within the limit: cut at the quietest frame in its last 8 s.
+            let lo = max(start + 1, end - 80)
+            end = (lo..<end).min(by: { db[$0] < db[$1] }) ?? end
+        }
+        pieces.append((start, max(end, start + 1)))
+        i = max(end, start + 1)
+    }
+    // Merge short neighbours (a pause shorter than a second or two between
+    // brief phrases) up to the limit, so the recognizer gets some context.
+    var merged: [(Int, Int)] = []
+    for p in pieces {
+        if let last = merged.last, p.1 - last.0 <= maxFrames, p.0 - last.1 <= 15 {
+            merged[merged.count - 1] = (last.0, p.1)
+        } else {
+            merged.append(p)
+        }
+    }
+    let f = AVAudioFramePosition(hop)
+    // Pad each piece by 200 ms either side so word edges aren't clipped.
+    return merged.map { (max(0, AVAudioFramePosition($0.0 - 2) * f),
+                         min(file.length, AVAudioFramePosition($0.1 + 2) * f)) }
+}
+
+/// Transcribe a finished recording piece by piece (see `speechPieces`); word
+/// timings give the time actually spent talking.
 func transcribeFile(_ path: String) -> Never {
     let url = URL(fileURLWithPath: path)
     guard let file = try? AVAudioFile(forReading: url) else {
@@ -183,21 +259,21 @@ func transcribeFile(_ path: String) -> Never {
         exit(1)
     }
     // The recognizer calls back on the main queue by default, and this function
-    // blocks the main thread on a semaphore per chunk: deliver results on a
-    // background queue or every chunk deadlocks until its timeout and comes
+    // blocks the main thread on a semaphore per piece: deliver results on a
+    // background queue or every piece deadlocks until its timeout and comes
     // back empty.
     recognizer.queue = OperationQueue()
     let format = file.processingFormat
-    let chunkFrames = AVAudioFrameCount(format.sampleRate * 50)
     var pieces: [String] = []
     var spans: [(Double, Double)] = [] // absolute word start/end seconds
-    var chunkStart = 0.0
     var chunkErrors: [String] = [] // recognizer errors, reported so failures aren't silent
-    while file.framePosition < file.length {
+    let parts = speechPieces(file)
+    for (from, to) in parts {
         let request = SFSpeechAudioBufferRecognitionRequest()
         configure(request)
         request.shouldReportPartialResults = false
-        var framesLeft = chunkFrames
+        file.framePosition = from
+        var framesLeft = AVAudioFrameCount(to - from)
         while framesLeft > 0 && file.framePosition < file.length {
             let n = min(AVAudioFrameCount(4096), framesLeft)
             guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: n) else { break }
@@ -214,21 +290,22 @@ func transcribeFile(_ path: String) -> Never {
                 best = r.bestTranscription
                 if r.isFinal { sem.signal() }
             } else if let e = error {
-                chunkErrors.append(e.localizedDescription)
+                // "No speech detected" on a piece that was only noise is normal.
+                if (e as NSError).code != 1110 { chunkErrors.append(e.localizedDescription) }
                 sem.signal()
             }
         }
-        if sem.wait(timeout: .now() + 180) == .timedOut {
+        if sem.wait(timeout: .now() + 120) == .timedOut {
             task.cancel()
-            chunkErrors.append("chunk timed out")
+            chunkErrors.append("piece timed out")
         }
-        if let t = best {
+        let offset = Double(from) / format.sampleRate
+        if let t = best, !t.formattedString.isEmpty {
             pieces.append(t.formattedString)
             for seg in t.segments {
-                spans.append((chunkStart + seg.timestamp, chunkStart + seg.timestamp + seg.duration))
+                spans.append((offset + seg.timestamp, offset + seg.timestamp + seg.duration))
             }
         }
-        chunkStart += Double(chunkFrames) / format.sampleRate
     }
     // Speaking time: word spans merged across gaps shorter than one second
     // (natural phrase pauses count as speaking; longer silences don't).
@@ -244,7 +321,7 @@ func transcribeFile(_ path: String) -> Never {
     }
     if let p = phrase { speaking += p.1 - p.0 }
     emit(["file_text": pieces.joined(separator: " "), "words": spans.count, "speaking_secs": speaking,
-          "errors": Array(Set(chunkErrors))])
+          "pieces": parts.count, "errors": Array(Set(chunkErrors))])
     exit(0)
 }
 
