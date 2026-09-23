@@ -266,7 +266,11 @@ fn recording_path() -> std::path::PathBuf {
 fn init_tracking(state: tauri::State<TrackingState>, text: String) -> Result<(), String> {
     let mut slot = state.0.lock().map_err(|_| "tracking state poisoned")?;
     // Clear any prior session FIRST: a failed init (or a new session) must not
-    // leave a stale tracker that later speech could feed into.
+    // leave a stale tracker that later speech could feed into. Its folder goes
+    // too, or a quick double start leaves an orphan behind.
+    if let Some(dir) = slot.as_ref().and_then(|s| s.session_dir.clone()) {
+        let _ = fs::remove_dir_all(dir);
+    }
     *slot = None;
     let parsed = script::parse(&text).map_err(|e| format!("{}", e))?;
     let mut tracker = ScriptTracker::new(&parsed);

@@ -40,6 +40,12 @@
   <button class="btn-ghost" id="btnClose" style="padding:8px 14px">Close</button>
 </div>
 
+<div class="idle-ask" id="idleAsk">
+  <span id="idleAskText"></span>
+  <button class="btn-ghost" id="idleKeep">Keep going</button>
+  <button class="btn-ghost" id="idleEnd">End session</button>
+</div>
+
 <div class="status" id="status">
   <div class="status-l">
     <div class="dot" id="dot"></div>
@@ -170,6 +176,8 @@ document.addEventListener('DOMContentLoaded', ()=>{
   els.btnFontDown.addEventListener('click', ()=>setFont(-2));
   els.btnFontUp.addEventListener('click', ()=>setFont(2));
   els.btnHelp.addEventListener('click', toggleHelp);
+  $('idleKeep').addEventListener('click', noteScript);
+  $('idleEnd').addEventListener('click', ()=>{ if(state==='run'||state==='pause'||state==='wait') endSession(); });
   els.btnEnd.addEventListener('click', ()=>{
     if(state==='run'||state==='pause'||state==='wait') endSession();
   });
@@ -337,11 +345,12 @@ async function startSession(){
   }
 
   startFollow();                                   // eased scroll follows the cursor
+  startIdleWatch();
   placeReadline(); updateGuide();
   updateSt(); startClock();
 }
 function resetAll(){
-  stopScroll(); stopClock(); stopAppleSpeech(); stopFollow();
+  stopScroll(); stopClock(); stopAppleSpeech(); stopFollow(); stopIdleWatch();
   invoke('clear_tracking').catch(()=>{});
   script=null; items=[]; idx=0; mainSentenceItemIdx=[]; state='idle'; branchCur=null;
   updateGuide();
@@ -411,6 +420,7 @@ async function startAppleSpeech(){
     // the cursor backward; the tracker already de-flickers partials.
     trackUnlisten = await listen('track-update', (event)=>{
       const u = event.payload;
+      if(u.matched) noteScript();
       if(state!=='run') return;
       // Reading a branch answer: highlight and hold that line on the reading line.
       if(u.state === 'in_branch'){ followBranch(u); return; }
@@ -482,7 +492,7 @@ function toggle(){
 
 // ── End session ──
 function endSession(){
-  state='done'; stopScroll(); stopClock(); stopAppleSpeech(); stopFollow();
+  state='done'; stopScroll(); stopClock(); stopAppleSpeech(); stopFollow(); stopIdleWatch();
   updateSt();
   const elapsed = t0 ? Math.floor((Date.now()-t0)/1000) : 0;
   const card = els.doneCard;
@@ -635,7 +645,7 @@ function endSession(){
 // Manual navigation re-anchors the voice tracker, so speech is matched from
 // where the speaker says they are (the "I'm here" override).
 function syncTracker(){
-  leaveBranch();
+  leaveBranch(); noteScript();
   // A pause/branch cue belongs to where the tracker was; the reader just moved.
   if(liveCue){ liveCue = null; turnEnded = false; updateSt(); }
   if(!audioMode) return;
@@ -779,6 +789,27 @@ function highlight(){
   if(els.stCurText && items[idx]) els.stCurText.textContent = items[idx].text.substring(0,50);
 
   updateNav(); updateProgress(); updateEnd();
+}
+
+// ── Idle safeguard (voice mode) ──
+// A session left running keeps recording the room. After a stretch with no
+// script heard, ask; if nobody answers, end the session (which stops the
+// recording). Patients can talk for a while, so the ask doesn't block anything.
+let IDLE_ASK_MS = 3*60*1000, IDLE_END_MS = 8*60*1000;
+let lastScriptAt = 0, idleTimer = null;
+function noteScript(){ lastScriptAt = Date.now(); $('idleAsk').classList.remove('show'); }
+function startIdleWatch(){ noteScript(); clearInterval(idleTimer); idleTimer = setInterval(checkIdle, 5000); }
+function stopIdleWatch(){ clearInterval(idleTimer); idleTimer = null; $('idleAsk').classList.remove('show'); }
+function checkIdle(){
+  if(!audioMode || !(state==='run'||state==='pause'||state==='wait')) return;
+  const quiet = Date.now() - lastScriptAt;
+  if(quiet >= IDLE_END_MS){ endSession(); return; }
+  if(quiet >= IDLE_ASK_MS){
+    const left = Math.max(1, Math.ceil((IDLE_END_MS - quiet)/60000));
+    $('idleAskText').textContent = 'Nothing from the script for ' + Math.floor(quiet/60000)
+      + ' minutes \u2014 the mic is still recording. Ends automatically in ' + left + ' min.';
+    $('idleAsk').classList.add('show');
+  }
 }
 
 // ── Branch answers (voice mode) ──
