@@ -115,10 +115,9 @@ fn convert_script(s: script::Script, source: String) -> ScriptData {
     }
 }
 
-// ── Shared stop flag for audio thread ──
-// AudioStream contains cpal::Stream which is !Send, so we can't store it
-// in Tauri state. Instead we spawn a dedicated thread that owns the stream
-// and communicate via an atomic stop flag.
+// ── Speech helper state ──
+// The Swift helper runs as a child process read by a dedicated thread; these
+// atomics let commands start, stop and observe it without holding a lock.
 
 static AUDIO_RUNNING: AtomicBool = AtomicBool::new(false);
 // Use a lazy-initialized Arc<AtomicBool> for the stop signal

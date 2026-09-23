@@ -17,8 +17,8 @@ Requires Rust, Cargo, and Tauri CLI (`cargo install tauri-cli`).
 # Build and install to /Applications
 ./scripts/build.sh --install
 
-# Manual build (if build.sh gives trouble)
-export CXXFLAGS="-I$(xcrun --show-sdk-path)/usr/include/c++/v1"
+# Manual build (if build.sh gives trouble); build.sh also compiles, embeds and
+# re-signs the Swift speech helper, which this skips
 cd crates/app && cargo tauri build --bundles app
 
 # Dev mode (hot reload)
@@ -34,7 +34,7 @@ cargo test -p prompter-core test_name
 cargo test -p prompter-core --test real_script_test
 ```
 
-The `CXXFLAGS` export is needed for whisper-rs C++ compilation on macOS. The `.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET=13.0`.
+The `.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET=13.0`. The core crate has no platform dependencies, so `cargo test -p prompter-core` also runs on Linux.
 
 ## Architecture
 
@@ -49,19 +49,20 @@ Pure-logic crate with no Tauri dependency. Feature-gated audio:
 - **`realign.rs`** — Post-session pass: global word alignment of the full-recording transcript against the whole script (per-sentence delivered / omitted, off-script words).
 - **`compliance.rs`** — Generates post-session reports (sections covered, time per section, adherence %, branch decisions). Writes markdown files to `~/meetings/consults/` with 0600 permissions.
 - **`coaching.rs`** — Data-driven delivery analysis (no LLM). Analyzes pacing, coverage, pause discipline, section balance. Produces severity-ranked insights.
-- **`transcribe.rs`** — Streaming Whisper wrapper (Tier 2). Keeps WhisperContext alive across audio chunks to avoid model reload penalty. Feature-gated behind `whisper`.
 - **`error.rs`** — Error types (`ParseError`, `PrompterError`).
 
-Audio capture and VAD are re-exported from `minutes-core` (sibling repo at `../minutes/crates/core`), not implemented here. The `audio` feature enables `minutes-core` streaming; the `whisper` feature adds `whisper-rs`.
+The core crate does no audio: speech comes from the app's Swift helper (below). The optional `sherpa` feature is the planned portable (Windows/Linux) speech engine.
 
 ### `prompter-app` (Tauri v2 binary)
-Desktop shell. Converts core types to JSON-serializable structs for the frontend, manages the audio thread, and exposes Tauri commands:
+Desktop shell. Converts core types to JSON-serializable structs for the frontend, runs the speech helper, and exposes Tauri commands:
 - `load_script` / `parse_script_text` — Parse from file or clipboard text
-- `start_audio` / `stop_audio` — Spawn/kill dedicated audio thread (cpal stream is `!Send`)
+- `init_tracking` / `finish_tracking` / `clear_tracking` — Session lifecycle (tracker, recorder, report, post-session check)
+- `start_speech` / `stop_speech` — Spawn/stop the Swift speech helper
+- `set_tracking_position` / `choose_branch` — Manual re-anchoring (arrows, clicks, branch buttons)
 - `save_compliance` / `get_coaching` — Post-session reporting
 - `load_settings` / `save_settings` — Persist to `~/.prompter/settings.json`
 - `list_available_scripts` — Watch `~/meetings/scripts/` directory
-- `set_always_on_top` — Window management
+- `set_always_on_top` / `set_hide_from_screen_share` — Window management (the latter synced with the tray item)
 - Deep link handling (`prompter://open?file=...` or `prompter://open?consultation_id=...`)
 
 Live speech comes from the Swift helper `scripts/speech-recognizer.swift` (Apple on-device Speech), bundled next to the app binary. Per session it gets `--script` (builds a custom language model from the script's spoken lines, macOS 14+), `--record` (16 kHz CAF for verification), and optionally `--system-audio` (ScreenCaptureKit call audio → `{"other": bool}`). After the session, `finish_tracking` writes the live report, then a background pass runs the helper in `--file` mode on the recording, re-aligns it (`realign.rs`), rewrites the report, deletes the audio (unless `keep_session_audio`), and emits `verification-complete`. Events: `speech`, `track-update`, `other-party`, `speech-status`, `speech-error` (fatal → timer fallback), `speech-warning` (non-fatal), `verification-complete` / `verification-failed`.
@@ -73,9 +74,8 @@ Single-file vanilla JS/HTML/CSS. No framework, no build step. Communicates with 
 
 ## Key conventions
 
-- **Feature gates**: `audio` and `whisper` are Cargo features. The app crate enables both; core can be used without audio for parsing/testing.
-- **minutes-core dependency**: Referenced as a local path (`../../../minutes/crates/core`). The Minutes repo must be cloned as a sibling for audio features to compile.
-- **Two-tier tracking**: Tier 1 (VAD-only) always works. Tier 2 (Whisper alignment) activates automatically if `~/.config/minutes/models/ggml-tiny.bin` exists.
+- **No sibling repos**: Prompter builds on its own (it no longer depends on `minutes-core`).
+- **Diagnostics**: `open -n -W -a Prompter --args --transcribe-file <audio> --script <md> --out <json>` runs the post-session check on any recording (speech access belongs to the app, so it can't run from a shell). Each live run's recognizer stream is in `~/.prompter/recording.jsonl`; replay it with `cargo run -p prompter-core --example replay`.
 - **Content protection**: `contentProtected: true` in tauri.conf.json prevents screen capture of the window.
 - **Script format**: `.script.md` — annotated markdown with optional YAML frontmatter, `> PAUSE:` and `> BRANCH:` directives. See SPEC.md.
 - **File paths**: Scripts in `~/meetings/scripts/`, compliance reports in `~/meetings/consults/`, settings in `~/.prompter/settings.json`.

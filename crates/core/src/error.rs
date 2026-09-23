@@ -4,10 +4,6 @@ use thiserror::Error;
 pub enum PrompterError {
     #[error(transparent)]
     Parse(#[from] ParseError),
-
-    #[cfg(feature = "audio")]
-    #[error("audio error: {0}")]
-    Audio(#[from] minutes_core::error::CaptureError),
 }
 
 #[derive(Debug, Error)]
