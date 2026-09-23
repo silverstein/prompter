@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "externalBin": ["binaries/speech-recognizer"],
+    "macOS": {
+      "entitlements": "Entitlements.plist"
+    }
+  }
+}

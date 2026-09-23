@@ -2,3 +2,6 @@
 .DS_Store
 *.swp
 .env*.local
+
+# Speech helper compiled by scripts/build.sh (Tauri externalBin)
+/crates/app/binaries/

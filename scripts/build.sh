@@ -2,29 +2,33 @@
 # Build Prompter: speech recognizer + Tauri app bundle + optional install
 set -e
 
-export CXXFLAGS="-I$(xcrun --show-sdk-path)/usr/include/c++/v1"
 export MACOSX_DEPLOYMENT_TARGET="13.0"
 
 echo "=== Building speech recognizer (Swift) ==="
-mkdir -p target
+# Tauri bundles it as an external binary (tauri.macos.conf.json), which it
+# expects under the target triple and signs along with the app.
+TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+mkdir -p crates/app/binaries
 # Target the app's minimum macOS (13) so the helper runs on older Macs too;
 # newer features (custom language model: macOS 14) are guarded at runtime.
-swiftc -O -target "$(uname -m)-apple-macos13.0" scripts/speech-recognizer.swift -o target/speech-recognizer
-echo "  Built target/speech-recognizer"
+swiftc -O -target "$(uname -m)-apple-macos13.0" scripts/speech-recognizer.swift \
+  -o "crates/app/binaries/speech-recognizer-$TRIPLE"
+echo "  Built crates/app/binaries/speech-recognizer-$TRIPLE"
 
 echo "=== Building Tauri app ==="
 cd crates/app
 cargo tauri build --bundles app
 cd ../..
 
-echo "=== Embedding speech recognizer in app bundle ==="
-cp target/speech-recognizer target/release/bundle/macos/Prompter.app/Contents/MacOS/speech-recognizer
-echo "  Embedded speech-recognizer in app bundle"
-# Adding a file after Tauri signed the bundle invalidates its signature (and
-# Gatekeeper then calls a downloaded copy "damaged"): re-sign ad hoc.
-codesign --force --deep --sign - target/release/bundle/macos/Prompter.app
-codesign --verify --deep --strict target/release/bundle/macos/Prompter.app
-echo "  Re-signed app bundle (ad hoc)"
+APP=target/release/bundle/macos/Prompter.app
+# With a signing identity (APPLE_SIGNING_IDENTITY) Tauri signs the bundle and
+# the helper. Without one, sign ad hoc so the bundle is still valid.
+if ! codesign --verify --deep --strict "$APP" 2>/dev/null; then
+  codesign --force --deep --options runtime \
+    --entitlements crates/app/Entitlements.plist --sign - "$APP"
+  echo "  Signed app bundle (ad hoc)"
+fi
+codesign --verify --deep --strict "$APP"
 
 echo "=== Build complete ==="
 echo "  App: target/release/bundle/macos/Prompter.app"

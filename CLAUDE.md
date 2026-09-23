@@ -17,8 +17,9 @@ Requires Rust, Cargo, and Tauri CLI (`cargo install tauri-cli`).
 # Build and install to /Applications
 ./scripts/build.sh --install
 
-# Manual build (if build.sh gives trouble); build.sh also compiles, embeds and
-# re-signs the Swift speech helper, which this skips
+# Manual build: compile the Swift helper to
+# crates/app/binaries/speech-recognizer-<host triple> first (Tauri bundles it
+# as an external binary via tauri.macos.conf.json), then:
 cd crates/app && cargo tauri build --bundles app
 
 # Dev mode (hot reload)
